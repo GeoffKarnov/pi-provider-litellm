@@ -10,6 +10,11 @@ export type SemanticModel = "deepseek-v4" | "kimi-k2.5-k2.6" | "kimi-k2.7-code" 
 
 type FamilyEvidence = SemanticFamily | "conflicting";
 
+export type MessagesBackendCompat = Pick<
+  NonNullable<Model<"anthropic-messages">["compat"]>,
+  "forceAdaptiveThinking" | "supportsTemperature" | "supportsStrictTools"
+>;
+
 type OpenAICompat = NonNullable<Model<"openai-completions">["compat"]>;
 
 export interface ReasoningPolicy {
@@ -26,6 +31,8 @@ export interface CatalogResolution {
   catalogModelId?: string;
   semanticFamily?: FamilyEvidence;
   semanticModel?: SemanticModel;
+  messagesCompat?: MessagesBackendCompat;
+  messagesThinkingLevelMap?: DiscoveredModel["thinkingLevelMap"];
   reasoning?: boolean;
   effortLevels?: string[];
   thinkingLevelMap?: DiscoveredModel["thinkingLevelMap"];
@@ -39,7 +46,7 @@ export type CatalogResolver = (entry: ModelInfoEntry) => CatalogResolution | und
 
 export interface ReducedModelGroup {
   id: string;
-  api: "openai-completions" | "openai-responses";
+  api: "anthropic-messages" | "openai-completions" | "openai-responses";
   reasoning: boolean;
   acceptsResponsesReasoningControl: boolean;
   thinkingLevelMap?: DiscoveredModel["thinkingLevelMap"];
@@ -51,6 +58,8 @@ export interface ReducedModelGroup {
   hasCompleteMetadata: boolean;
   catalogProvider?: string;
   semanticModel?: SemanticModel;
+  semanticFamily?: FamilyEvidence;
+  messagesCompat?: MessagesBackendCompat;
   // Set when deployments disagreed on catalog provider identity, so catalog
   // limits, pricing, and reasoning metadata were withheld for the whole group.
   catalogAuthorityAmbiguous?: boolean;
@@ -113,6 +122,11 @@ function sortValue(value: unknown, depth = 0): unknown {
       .sort(([left], [right]) => left.localeCompare(right))
       .map(([key, child]) => [key, sortValue(child, depth + 1)]),
   );
+}
+
+// Compare catalog policies without depending on object key order.
+export function stableJson(value: unknown): string | undefined {
+  return value === undefined ? undefined : JSON.stringify(sortValue(value));
 }
 
 function stableEntry(entry: ModelInfoEntry): string {
@@ -348,7 +362,7 @@ export function toResponsesLevels(
 // The one place a level map is paired with a serializer conclusion. Every
 // discovery, cache, health and singleton path consumes the whole returned object.
 export function closeSerializerPolicy(input: {
-  api: "openai-completions" | "openai-responses";
+  api: "anthropic-messages" | "openai-completions" | "openai-responses";
   reasoning: boolean;
   vendorCompat: DiscoveredModel["compat"];
   semanticCompat?: ReasoningPolicy["compat"];
@@ -374,6 +388,20 @@ export function closeSerializerPolicy(input: {
     acceptsResponsesReasoningControl,
     denyLevels,
   } = input;
+  if (api === "anthropic-messages") {
+    const messagesCompat = vendorCompat as Model<"anthropic-messages">["compat"];
+    const fields = ["forceAdaptiveThinking", "supportsTemperature", "supportsStrictTools"] as const;
+    const entries = fields
+      .filter((field) => messagesCompat?.[field] !== undefined)
+      .map((field) => [field, messagesCompat?.[field]]);
+    return {
+      reasoning,
+      compat: entries.length > 0 ? Object.fromEntries(entries) : undefined,
+      ...(reasoning && (denyLevels || catalogLevels)
+        ? { thinkingLevelMap: denyLevels ? NO_TRANSMISSIBLE_LEVELS : catalogLevels }
+        : {}),
+    };
+  }
   if (api === "openai-responses") {
     // Responses always serializes a selected level as `reasoning.effort`.
     // Chat-only evidence such as `thinking` cannot authorize that carrier.
@@ -720,6 +748,20 @@ export function reduceModelGroup(
     !hasCatalogAuthority &&
     catalogs.some((catalog) => catalog?.provider !== undefined || catalog?.catalogModelId !== undefined);
   const semanticModel = unanimous(catalogs.map((catalog) => catalog?.semanticModel));
+  const semanticFamily = unanimous(catalogs.map((catalog) => catalog?.semanticFamily));
+  const messagesCompat = unanimous(catalogs.map((catalog) => stableJson(catalog?.messagesCompat)));
+  const messagesEndpointAllowed = deployments.every((entry) => {
+    const endpoints = entry.model_info?.supported_endpoints;
+    return !Array.isArray(endpoints) || endpoints.includes("/v1/messages");
+  });
+  const api = candidateModes.every((mode) => mode === "responses")
+    ? "openai-responses"
+    : candidateModes.every((mode) => mode === "chat") &&
+        messagesEndpointAllowed &&
+        semanticFamily === "claude" &&
+        messagesCompat
+      ? "anthropic-messages"
+      : "openai-completions";
   const reasoningEvidence = deployments.map(
     (entry, index) => wireBoolean(entry.model_info?.supports_reasoning) ?? catalogAuthority[index]?.reasoning,
   );
@@ -801,7 +843,30 @@ export function reduceModelGroup(
   const evidenceLevelMap = reasoningLevelMap(deployments, publicEfforts, [
     intersectThinkingLevelMaps(catalogAuthority.map((catalog) => catalog?.thinkingLevelMap)),
   ]);
-  const thinkingLevelMap = reasoning && acceptsResponsesReasoningControl ? evidenceLevelMap : undefined;
+  let thinkingLevelMap = reasoning && acceptsResponsesReasoningControl ? evidenceLevelMap : undefined;
+  if (api === "anthropic-messages") {
+    const nativeCatalogs = hasCatalogAuthority ? catalogAuthority : catalogAuthorityAmbiguous ? [] : catalogs;
+    const nativeMap = unanimous(
+      nativeCatalogs.map((catalog) => stableJson(catalog?.messagesThinkingLevelMap ?? catalog?.thinkingLevelMap)),
+    );
+    thinkingLevelMap = nativeMap ? JSON.parse(nativeMap) : undefined;
+    if (thinkingLevelMap) {
+      // OpenAI effort flags can restrict a native catalog level, never add a
+      // level or replace an Anthropic effort with an OpenAI spelling.
+      for (const [level, flag] of Object.entries(LITELLM_LEVEL_FLAGS) as Array<
+        [keyof typeof LITELLM_LEVEL_FLAGS, (typeof LITELLM_LEVEL_FLAGS)[keyof typeof LITELLM_LEVEL_FLAGS]]
+      >) {
+        const reported = deployments.map((entry) => entry.model_info?.[flag]);
+        if (
+          thinkingLevelMap[level] !== undefined &&
+          reported.some((value) => value !== undefined) &&
+          !reported.every((value) => wireBoolean(value) === true)
+        ) {
+          thinkingLevelMap[level] = null;
+        }
+      }
+    }
+  }
   const kimiEvidence = deployments.map((entry) => kimiDeploymentEvidence(entry));
   const unanimousNormalKimi = kimiEvidence.every((evidence) => evidence.identified && !evidence.forcedThinking);
   const unanimousMoonshotTransport = kimiEvidence.every((evidence) => evidence.moonshotTransport);
@@ -844,7 +909,7 @@ export function reduceModelGroup(
 
   return {
     id,
-    api: candidateModes.every((mode) => mode === "responses") ? "openai-responses" : "openai-completions",
+    api,
     reasoning,
     acceptsResponsesReasoningControl,
     ...(thinkingLevelMap ? { thinkingLevelMap } : {}),
@@ -856,6 +921,8 @@ export function reduceModelGroup(
     hasCompleteMetadata,
     ...(hasCatalogAuthority ? { catalogProvider } : {}),
     ...(semanticModel ? { semanticModel } : {}),
+    ...(semanticFamily ? { semanticFamily } : {}),
+    ...(messagesCompat ? { messagesCompat: JSON.parse(messagesCompat) } : {}),
     ...(catalogAuthorityAmbiguous ? { catalogAuthorityAmbiguous: true } : {}),
     deploymentFamilies: catalogs.map((catalog) => catalog?.semanticFamily),
     normalizeThinkTags: unanimousNormalKimi,

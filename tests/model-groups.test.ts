@@ -7,6 +7,7 @@ import {
   meetVendorCompat,
   NO_TRANSMISSIBLE_LEVELS,
   reduceModelGroup,
+  stableJson,
   toResponsesLevels,
 } from "../src/model-groups.js";
 import { intersectThinkingLevelMaps } from "../src/thinking-levels.js";
@@ -2188,5 +2189,166 @@ describe("upstream reduction regressions", () => {
     // Conflicting identities, and partial evidence, both withhold authority.
     expect(reduceModelGroup([anthropic, openai], resolveCatalog)?.catalogAuthorityAmbiguous).toBe(true);
     expect(reduceModelGroup([anthropic, unresolved], resolveCatalog)?.catalogAuthorityAmbiguous).toBe(true);
+  });
+});
+
+describe("stableJson", () => {
+  it("preserves array order in canonical identity", () => {
+    const first = [{ threshold: 1 }, { threshold: 2 }];
+    const reversed = [...first].reverse();
+
+    expect(stableJson(first)).not.toBe(stableJson(reversed));
+    expect(stableJson([{ b: 2, a: 1 }])).toBe(stableJson([{ a: 1, b: 2 }]));
+  });
+});
+
+describe("native Messages route selection", () => {
+  it("closes native reasoning without inheriting OpenAI controls", () => {
+    expect(
+      closeSerializerPolicy({
+        api: "anthropic-messages",
+        reasoning: true,
+        vendorCompat: { forceAdaptiveThinking: true, supportsReasoningEffort: true },
+        semanticCompat: { thinkingFormat: "openai" },
+        semanticLevels: { off: "none", max: "xhigh" },
+        catalogLevels: { off: null, max: "max" },
+      }),
+    ).toEqual({
+      reasoning: true,
+      compat: { forceAdaptiveThinking: true },
+      thinkingLevelMap: { off: null, max: "max" },
+    });
+  });
+
+  const claude = (compat: { forceAdaptiveThinking?: boolean } = {}) => ({
+    provider: "amazon-bedrock",
+    semanticFamily: "claude" as const,
+    messagesCompat: compat,
+  });
+
+  it("selects Messages for a homogeneous strongly evidenced Claude group", () => {
+    const result = reduceModelGroup(
+      [
+        { model_name: "claude-route", model_info: { id: "a", mode: "chat" } },
+        { model_name: "claude-route", model_info: { id: "b", mode: "chat" } },
+      ],
+      () => claude({ forceAdaptiveThinking: true }),
+    );
+
+    expect(result).toMatchObject({
+      api: "anthropic-messages",
+      catalogProvider: "amazon-bedrock",
+      semanticFamily: "claude",
+      messagesCompat: { forceAdaptiveThinking: true },
+    });
+  });
+
+  it("respects explicit Messages endpoint capability", () => {
+    const supported = reduceModelGroup(
+      [
+        {
+          model_name: "claude-route",
+          model_info: { id: "a", mode: "chat", supported_endpoints: ["/v1/chat/completions", "/v1/messages"] },
+        },
+      ],
+      () => claude({}),
+    );
+    const excluded = reduceModelGroup(
+      [
+        {
+          model_name: "claude-route",
+          model_info: { id: "a", mode: "chat", supported_endpoints: ["/v1/chat/completions"] },
+        },
+      ],
+      () => claude({}),
+    );
+    const partiallyMalformedIncludingMessages = reduceModelGroup(
+      [
+        {
+          model_name: "claude-route",
+          model_info: { id: "a", mode: "chat", supported_endpoints: ["/v1/messages", 42] as never },
+        },
+      ],
+      () => claude({}),
+    );
+    const partiallyMalformedOmittingMessages = reduceModelGroup(
+      [
+        {
+          model_name: "claude-route",
+          model_info: { id: "a", mode: "chat", supported_endpoints: ["/v1/chat/completions", 42] as never },
+        },
+      ],
+      () => claude({}),
+    );
+
+    expect(supported?.api).toBe("anthropic-messages");
+    expect(excluded?.api).toBe("openai-completions");
+    expect(partiallyMalformedIncludingMessages?.api).toBe("anthropic-messages");
+    expect(partiallyMalformedOmittingMessages?.api).toBe("openai-completions");
+  });
+
+  it.each([
+    ["mixed family", [claude({}), { provider: "openai", semanticFamily: "openai" as const }]],
+    ["unknown sibling", [claude({}), undefined]],
+    ["different Messages compatibility", [claude({ forceAdaptiveThinking: true }), claude({})]],
+  ])("keeps %s groups on Chat Completions", (_name, evidence) => {
+    const result = reduceModelGroup(
+      [
+        { model_name: "mixed-route", model_info: { id: "a", mode: "chat" } },
+        { model_name: "mixed-route", model_info: { id: "b", mode: "chat" } },
+      ],
+      () => evidence.shift(),
+    );
+
+    expect(result?.api).toBe("openai-completions");
+  });
+
+  it("keeps explicit Responses mode authoritative for Claude", () => {
+    const result = reduceModelGroup([{ model_name: "claude-route", model_info: { id: "a", mode: "responses" } }], () =>
+      claude({}),
+    );
+
+    expect(result?.api).toBe("openai-responses");
+  });
+
+  it("does not inject router OpenAI effort values into a Messages model", () => {
+    const result = reduceModelGroup(
+      [
+        {
+          model_name: "claude-route",
+          model_info: {
+            id: "a",
+            mode: "chat",
+            supports_minimal_reasoning_effort: true,
+            supports_xhigh_reasoning_effort: true,
+          },
+        },
+      ],
+      () => ({
+        ...claude({ forceAdaptiveThinking: true }),
+        thinkingLevelMap: { max: "max" },
+      }),
+    );
+
+    expect(result).toMatchObject({ api: "anthropic-messages", thinkingLevelMap: { max: "max" } });
+    expect(result?.thinkingLevelMap).not.toHaveProperty("minimal");
+    expect(result?.thinkingLevelMap).not.toHaveProperty("xhigh");
+  });
+
+  it("lets router evidence disable but not rename a catalogued Messages effort", () => {
+    const result = reduceModelGroup(
+      [
+        {
+          model_name: "claude-route",
+          model_info: { id: "a", mode: "chat", supports_xhigh_reasoning_effort: false },
+        },
+      ],
+      () => ({
+        ...claude({ forceAdaptiveThinking: true }),
+        thinkingLevelMap: { xhigh: "xhigh", max: "max" },
+      }),
+    );
+
+    expect(result?.thinkingLevelMap).toEqual({ xhigh: null, max: "max" });
   });
 });

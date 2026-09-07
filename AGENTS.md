@@ -80,6 +80,7 @@
 ## Compatibility Rules
 
 - Provider-specific request compatibility belongs in discovered model `compat` metadata, not broad runtime mutation.
+- Native Messages requires unanimous compatible Claude deployment evidence; evidence-free fallback and health discovery never select it. Keep Messages compatibility separate from Chat and Responses fields.
 - Kimi/Moonshot-style compatibility is split across `completionsCompat()` and `responsesCompat()`; `buildCompat()` is retained only as the completions alias. Keep regression tests with model discovery changes.
 - Anthropic-backed aliases using `openai-completions` need `cacheControlFormat: "anthropic"` so Pi forwards prompt-cache markers through LiteLLM; `openai-responses` uses its native prompt cache fields instead.
 
@@ -88,7 +89,7 @@
 - CI runs `npm ci` and `npm run prepublishOnly`; release relies on `npm publish` invoking `prepublishOnly`.
 - `.github/workflows/litellm-smoke.yml` uses VidaiMock plus a real LiteLLM proxy; it should not require real provider API keys.
 - Keep smoke readiness probes bounded with `curl --connect-timeout 1 --max-time 3`.
-- `scripts/smoke-runner.ts` exercises discovery and `/v1/chat/completions` through the proxy.
+- `scripts/smoke-runner.ts` exercises discovery and all three selected protocol endpoints through the proxy; the Pi CLI smoke independently proves the extension's native Messages path.
 - The non-interactive Pi CLI smoke loads the package root (`-e .`) so it exercises `pi.extensions` resolution; the interactive terminal smoke loads `src/index.ts` by path.
 - `--list-models` alone does not prove an extension loaded, because Pi also reports models from its own store. Assert a load-specific side effect instead.
 

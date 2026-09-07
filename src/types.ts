@@ -3,7 +3,7 @@ import type { BackendFamily, LITELLM_DISCOVERY_VERSION } from "./backend-identit
 
 export type DiscoverySource = "model_info" | "models_list" | "health";
 
-export type LiteLLMApi = "openai-completions" | "openai-responses";
+export type LiteLLMApi = "anthropic-messages" | "openai-completions" | "openai-responses";
 
 export type LiteLLMRuntimeAuth = {
   baseUrl: string;
