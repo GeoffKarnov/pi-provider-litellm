@@ -1,13 +1,21 @@
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { getModel } from "@earendil-works/pi-ai/compat";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+const agentDir = await mkdtemp(join(tmpdir(), "pi-litellm-discover-"));
+vi.mock("@earendil-works/pi-coding-agent", () => ({
+  getAgentDir: () => agentDir,
+}));
+
 import {
   buildCompat,
   discoverModels,
   emitsThinkTags,
+  enrichCachedModel,
   modelProtocol,
+  moonshotPolicy,
   normalizeBaseUrl,
   resolveModelInfoCatalog,
 } from "../src/discover.js";
@@ -41,9 +49,39 @@ function jsonResponse(status: number, body: unknown): Response {
   });
 }
 
+afterAll(async () => {
+  await rm(agentDir, { recursive: true, force: true });
+});
+
 afterEach(() => {
   vi.restoreAllMocks();
 });
+
+const NO_REASONING_LEVELS = {
+  off: null,
+  minimal: null,
+  low: null,
+  medium: null,
+  high: null,
+  xhigh: null,
+  max: null,
+};
+
+function cachedReasoningModel(api: "openai-completions" | "openai-responses", overrides: Record<string, unknown> = {}) {
+  return {
+    id: "cached-reasoning",
+    name: "Cached reasoning",
+    provider: "litellm",
+    api,
+    baseUrl: "https://litellm.example.com/v1",
+    reasoning: true,
+    input: ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 128_000,
+    maxTokens: 16_384,
+    ...overrides,
+  } as never;
+}
 
 describe("normalizeBaseUrl", () => {
   it("rejects insecure non-loopback endpoints", () => {
@@ -272,6 +310,127 @@ describe("Kimi reasoning compatibility", () => {
   });
 });
 
+describe("moonshotPolicy", () => {
+  it("keeps request suppression disabled for route-name-only fallback evidence", () => {
+    expect(moonshotPolicy("kimi-k2.6")).toEqual({
+      normalizeStrictToolMessages: false,
+      normalizeThinkTags: true,
+      suppressReasoningVisibility: false,
+    });
+  });
+
+  it("preserves always-thinking output and visibility behavior", () => {
+    expect(moonshotPolicy("kimi-k2-thinking")).toEqual({
+      normalizeStrictToolMessages: false,
+      normalizeThinkTags: false,
+      suppressReasoningVisibility: false,
+    });
+  });
+});
+
+describe("enrichCachedModel reasoning policy", () => {
+  it("removes a stale thinking level map from a cached non-reasoning model", () => {
+    const enriched = enrichCachedModel(
+      cachedReasoningModel("openai-completions", {
+        reasoning: false,
+        thinkingLevelMap: { low: "low", high: "high" },
+      }),
+    );
+
+    expect(enriched.reasoning).toBe(false);
+    expect(enriched).not.toHaveProperty("thinkingLevelMap");
+  });
+
+  it("denies Pi default Chat levels when a legacy cache has no level or carrier evidence", () => {
+    expect(enrichCachedModel(cachedReasoningModel("openai-completions"))).toMatchObject({
+      reasoning: true,
+      thinkingLevelMap: NO_REASONING_LEVELS,
+    });
+  });
+
+  it("denies Pi default Chat levels after catalog enrichment has no level or carrier evidence", () => {
+    const enriched = enrichCachedModel(
+      cachedReasoningModel("openai-completions", {
+        id: "claude-haiku-4-5",
+        name: "claude-haiku-4-5 (no metadata)",
+        reasoning: false,
+      }),
+    );
+
+    expect(enriched).toMatchObject({
+      name: "Claude Haiku 4.5 (latest)",
+      reasoning: true,
+      thinkingLevelMap: NO_REASONING_LEVELS,
+    });
+  });
+
+  it("updates cached fallback transport from the resolved Pi catalog entry", () => {
+    const enriched = enrichCachedModel(
+      cachedReasoningModel("openai-completions", {
+        id: "openai/gpt-4o",
+        name: "openai/gpt-4o (no metadata)",
+        reasoning: false,
+        compat: { supportsStore: false },
+      }),
+    );
+
+    expect(enriched).toMatchObject({
+      name: "GPT-4o",
+      api: "openai-responses",
+      compat: undefined,
+    });
+  });
+
+  it("denies cached Chat levels when no compatibility metadata proves a carrier", () => {
+    expect(
+      enrichCachedModel(
+        cachedReasoningModel("openai-completions", {
+          thinkingLevelMap: { low: "low", high: "high" },
+        }),
+      ),
+    ).toMatchObject({
+      reasoning: true,
+      thinkingLevelMap: NO_REASONING_LEVELS,
+      compat: { supportsReasoningEffort: false },
+    });
+  });
+
+  it("closes cached Chat levels when compatibility metadata proves a carrier", () => {
+    expect(
+      enrichCachedModel(
+        cachedReasoningModel("openai-completions", {
+          thinkingLevelMap: { low: "low", high: "high" },
+          compat: { supportsReasoningEffort: true },
+        }),
+      ).thinkingLevelMap,
+    ).toEqual({ low: "low", high: "high" });
+  });
+
+  it("keeps Responses cache behavior unchanged with and without explicit control evidence", () => {
+    expect(enrichCachedModel(cachedReasoningModel("openai-responses"))).toMatchObject({
+      reasoning: true,
+      thinkingLevelMap: NO_REASONING_LEVELS,
+    });
+
+    expect(
+      enrichCachedModel(
+        cachedReasoningModel("openai-responses", {
+          thinkingLevelMap: { low: "low", high: "high" },
+          litellmResponsesReasoningControl: true,
+        }),
+      ).thinkingLevelMap,
+    ).toEqual({
+      off: "none",
+      minimal: "minimal",
+      low: "low",
+      medium: "medium",
+      high: "high",
+      xhigh: null,
+      max: null,
+    });
+  });
+});
+
 describe("discoverModels via /model/info", () => {
   it.each([
     { mode: "chat", api: "openai-completions", params: { model: "chatgpt/gpt-5.6-sol" } },
@@ -491,7 +650,7 @@ describe("discoverModels via /model/info", () => {
     });
   });
 
-  it("does not infer reasoning from models.dev effort levels", async () => {
+  it.each([undefined, false])("combines explicit reasoning=%s with models.dev effort evidence", async (reasoning) => {
     const dir = await mkdtemp(join(tmpdir(), "litellm-model-info-reasoning-"));
     const cachePath = join(dir, "models-dev.json");
     await writeFile(
@@ -514,7 +673,7 @@ describe("discoverModels via /model/info", () => {
             {
               model_name: "private-route",
               litellm_params: { model: "private/reasoner" },
-              model_info: { mode: "chat" },
+              model_info: { mode: "chat", supports_reasoning: reasoning },
             },
           ],
         }),
@@ -525,8 +684,12 @@ describe("discoverModels via /model/info", () => {
       modelsDevCachePath: cachePath,
     });
 
-    expect(result.models[0]).toMatchObject({ reasoning: false, name: "private-route (incomplete metadata)" });
-    expect(result.models[0]).not.toHaveProperty("thinkingLevelMap");
+    expect(result.models[0]).toMatchObject({
+      reasoning: reasoning !== false,
+      name: "private-route (incomplete metadata)",
+    });
+    if (reasoning === false) expect(result.models[0]).not.toHaveProperty("thinkingLevelMap");
+    else expect(result.models[0]?.thinkingLevelMap).toEqual(NO_REASONING_LEVELS);
   });
 
   it("lets initial public-catalog callers abort independently", async () => {
@@ -792,14 +955,13 @@ describe("discoverModels via /model/info", () => {
         data: [
           {
             model_name: "custom/reasoner",
+            litellm_params: { allowed_openai_params: ["reasoning_effort"] },
             model_info: {
               mode: "chat",
               supports_reasoning: true,
               supports_none_reasoning_effort: true,
               supports_minimal_reasoning_effort: false,
               supports_low_reasoning_effort: false,
-              supports_medium_reasoning_effort: false,
-              supports_high_reasoning_effort: true,
               supports_xhigh_reasoning_effort: false,
               supports_max_reasoning_effort: true,
             },
@@ -814,21 +976,24 @@ describe("discoverModels via /model/info", () => {
       off: "none",
       minimal: null,
       low: null,
-      medium: null,
-      high: "high",
       xhigh: null,
       max: "max",
     });
   });
 
-  it("merges singleton router reasoning effort flags over catalog metadata", async () => {
+  it("merges singleton router effort flags into supported Responses levels", async () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(
       jsonResponse(200, {
         data: [
           {
             model_name: "openai/gpt-5.6-luna",
-            litellm_params: { model: "openai/gpt-5.6-luna" },
-            model_info: { mode: "chat", supports_reasoning: true, supports_xhigh_reasoning_effort: false },
+            litellm_params: { model: "openai/gpt-5.6-luna", allowed_openai_params: ["reasoning_effort"] },
+            model_info: {
+              mode: "chat",
+              supports_reasoning: true,
+              supports_xhigh_reasoning_effort: false,
+              supports_max_reasoning_effort: true,
+            },
           },
         ],
       }),
@@ -836,7 +1001,7 @@ describe("discoverModels via /model/info", () => {
 
     const result = await discoverModels("https://litellm.example.com", "sk-test", { modelsDev: false });
 
-    expect(result.models[0]?.thinkingLevelMap).toMatchObject({ off: "none", xhigh: null, max: "max" });
+    expect(result.models[0]?.thinkingLevelMap).toMatchObject({ off: "none", xhigh: null, max: null });
   });
 
   it("uses family-only identity to look up models.dev under its public provider", async () => {
@@ -955,14 +1120,14 @@ describe("discoverModels via /model/info", () => {
     ]);
   });
 
-  it("preserves catalog max thinking metadata for /model/info models", async () => {
+  it("preserves catalog xhigh while denying literal max on Responses", async () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(
       jsonResponse(200, {
         data: [
           {
             model_name: "openai/gpt-5.6-luna",
-            litellm_params: { model: "openai/gpt-5.6-luna" },
-            model_info: { mode: "chat" },
+            litellm_params: { model: "openai/gpt-5.6-luna", allowed_openai_params: ["reasoning_effort"] },
+            model_info: { mode: "chat", supports_xhigh_reasoning_effort: true, supports_max_reasoning_effort: true },
           },
         ],
       }),
@@ -970,7 +1135,7 @@ describe("discoverModels via /model/info", () => {
 
     const result = await discoverModels("https://litellm.example.com", "sk-test", { modelsDev: false });
 
-    expect(result.models[0]?.thinkingLevelMap).toMatchObject({ off: "none", xhigh: "xhigh", max: "max" });
+    expect(result.models[0]?.thinkingLevelMap).toMatchObject({ off: "none", xhigh: "xhigh", max: null });
   });
 
   it("reduces duplicate model ids conservatively instead of merging richer fields", async () => {
@@ -1064,6 +1229,7 @@ describe("discoverModels via /model/info", () => {
 
   it.each([
     ["moonshot", "moonshot/kimi-k2.6"],
+    ["gemini", "gemini/gemini-3.1-pro-preview"],
     ["xai", "xai/grok-4.5"],
   ])("maps the %s adapter conservatively to its catalog", async (adapter, backend) => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(
@@ -1078,13 +1244,16 @@ describe("discoverModels via /model/info", () => {
       }),
     );
 
-    const result = await discoverModels("https://litellm.example.com", "sk-test", { modelsDev: false });
+    const result = await discoverModels("https://litellm.example.com", "sk-test", {});
 
     expect(result.models[0]?.name).toBe(`${adapter}-route`);
     expect(result.models[0]?.name).not.toContain("no metadata");
     expect(result.models[0]?.contextWindow).toBeGreaterThan(128_000);
     expect(result.models[0]?.cost.input).toBeGreaterThan(0);
     expect(result.models[0]?.id).toBe(`${adapter}-route`);
+    if (adapter === "gemini") {
+      expect(result.models[0]?.litellmPolicy?.normalizeGeminiReasoningEffort).toBe(true);
+    }
   });
 
   it("trims backend candidates before catalog resolution", async () => {
@@ -1624,6 +1793,7 @@ describe("discoverModels via /model/info", () => {
     expect(result.models[0]).toMatchObject({ api: "openai-responses" });
     expect(result.models[0]?.compat).toEqual({
       supportsDeveloperRole: false,
+      supportsStrictMode: false,
     });
   });
 
@@ -1705,7 +1875,7 @@ describe("discoverModels via /model/info", () => {
               model_info: {
                 mode: "chat",
                 supports_reasoning: true,
-                supports_high_reasoning_effort: true,
+                supports_low_reasoning_effort: true,
               },
             },
           ],
@@ -1719,7 +1889,7 @@ describe("discoverModels via /model/info", () => {
 
     expect(result.source).toBe("health");
     expect(result.models.map((model) => model.id)).toEqual(["named-route"]);
-    expect(result.models[0]).not.toHaveProperty("thinkingLevelMap");
+    expect(result.models[0]?.thinkingLevelMap).toEqual(NO_REASONING_LEVELS);
   });
 
   it("withholds a health deployment whose route name is not a string", async () => {
@@ -1976,7 +2146,10 @@ describe("discoverModels via /model/info", () => {
 
     const result = await discoverModels("https://litellm.example.com", "sk-test", { modelsDev: false });
 
-    expect(result.models[0]?.compat).toEqual(buildCompat("kimi-k3"));
+    expect(result.models[0]?.compat).toMatchObject({
+      ...buildCompat("kimi-k3"),
+      requiresReasoningContentOnAssistantMessages: true,
+    });
   });
 
   it.each([
@@ -1991,7 +2164,7 @@ describe("discoverModels via /model/info", () => {
           litellm_provider: "azure",
         },
       },
-      false,
+      true,
     ],
     [
       "Bedrock-hosted Kimi",
@@ -2004,7 +2177,7 @@ describe("discoverModels via /model/info", () => {
           litellm_provider: "bedrock_converse",
         },
       },
-      false,
+      true,
     ],
     [
       "opaque Moonshot alias",
@@ -2015,18 +2188,18 @@ describe("discoverModels via /model/info", () => {
       },
       true,
     ],
-  ] as const)("derives reasoning suppression from the transport for %s", async (_name, entry, suppress) => {
+  ] as const)("derives reasoning visibility from backend family evidence for %s", async (_name, entry, suppress) => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse(200, { data: [entry] }));
 
     const result = await discoverModels("https://litellm.example.com", "sk-test", {});
 
-    expect(result.models[0]?.suppressReasoningContent === true).toBe(suppress);
+    expect(result.models[0]?.litellmPolicy?.suppressReasoningVisibility === true).toBe(suppress);
   });
 
   it.each([
     ["Moonshot deployments", ["moonshot/kimi-k3", "moonshot/kimi-k3"], true],
-    ["mixed deployments", ["moonshot/kimi-k3", "azure_ai/FW-Kimi-K3"], false],
-    ["reversed mixed deployments", ["azure_ai/FW-Kimi-K3", "moonshot/kimi-k3"], false],
+    ["mixed deployments", ["moonshot/kimi-k3", "azure_ai/FW-Kimi-K3"], true],
+    ["reversed mixed deployments", ["azure_ai/FW-Kimi-K3", "moonshot/kimi-k3"], true],
     ["incomplete deployment metadata", ["moonshot/kimi-k3", undefined], false],
   ] as const)("aggregates %s conservatively", async (_name, routes, suppress) => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(
@@ -2041,7 +2214,7 @@ describe("discoverModels via /model/info", () => {
 
     const result = await discoverModels("https://litellm.example.com", "sk-test", { modelsDev: false });
 
-    expect(result.models[0]?.suppressReasoningContent === true).toBe(suppress);
+    expect(result.models[0]?.litellmPolicy?.suppressReasoningVisibility === true).toBe(suppress);
   });
 
   it.each([
@@ -2090,7 +2263,7 @@ describe("discoverModels via /model/info", () => {
           litellm_provider: "azure",
         },
       },
-      false,
+      true,
     ],
     [
       "Bedrock-hosted Kimi",
@@ -2103,7 +2276,7 @@ describe("discoverModels via /model/info", () => {
           litellm_provider: "bedrock_converse",
         },
       },
-      false,
+      true,
     ],
     [
       "Moonshot-hosted opaque alias",
@@ -2114,12 +2287,12 @@ describe("discoverModels via /model/info", () => {
       },
       true,
     ],
-  ] as const)("keeps reasoning suppression transport-scoped for %s", async (_name, entry, suppress) => {
+  ] as const)("keeps reasoning visibility independent of hosting transport for %s", async (_name, entry, suppress) => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse(200, { data: [entry] }));
 
     const result = await discoverModels("https://litellm.example.com", "sk-test", { modelsDev: false });
 
-    expect(result.models[0]?.suppressReasoningContent === true).toBe(suppress);
+    expect(result.models[0]?.litellmPolicy?.suppressReasoningVisibility === true).toBe(suppress);
   });
 
   it("does not suppress an alias routed to a forced-thinking Moonshot model", async () => {
@@ -2137,16 +2310,16 @@ describe("discoverModels via /model/info", () => {
 
     const result = await discoverModels("https://litellm.example.com", "sk-test", { modelsDev: false });
 
-    expect(result.models[0]?.suppressReasoningContent).toBeUndefined();
+    expect(result.models[0]?.litellmPolicy?.suppressReasoningVisibility === true).toBe(false);
   });
 
   it.each([
     ["provider-only metadata", { custom_llm_provider: "moonshot" }],
     [
-      "conflicting Moonshot provider and Azure backend",
+      "Moonshot provider and Azure-hosted Kimi backend",
       { custom_llm_provider: "moonshot", model: "azure_ai/FW-Kimi-K3" },
     ],
-  ])("does not suppress with %s", async (_name, litellm_params) => {
+  ])("uses Kimi family evidence with %s", async (_name, litellm_params) => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(
       jsonResponse(200, {
         data: [{ model_name: "kimi-prod", litellm_params, model_info: { mode: "chat" } }],
@@ -2155,13 +2328,13 @@ describe("discoverModels via /model/info", () => {
 
     const result = await discoverModels("https://litellm.example.com", "sk-test", { modelsDev: false });
 
-    expect(result.models[0]?.suppressReasoningContent).toBeUndefined();
+    expect(result.models[0]?.litellmPolicy?.suppressReasoningVisibility).toBe(true);
   });
 
   it("keeps route evidence isolated between discoveries", async () => {
     vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
       const url = String(input);
-      const model = url.startsWith("https://moonshot.example.com") ? "moonshot/kimi-k3" : "azure_ai/FW-Kimi-K3";
+      const model = url.startsWith("https://moonshot.example.com") ? "moonshot/kimi-k3" : "azure/gpt-4o";
       return jsonResponse(200, {
         data: [
           {
@@ -2176,8 +2349,8 @@ describe("discoverModels via /model/info", () => {
     const moonshot = await discoverModels("https://moonshot.example.com", "sk-test", { modelsDev: false });
     const azure = await discoverModels("https://azure.example.com", "sk-test", { modelsDev: false });
 
-    expect(moonshot.models[0]?.suppressReasoningContent).toBe(true);
-    expect(azure.models[0]?.suppressReasoningContent).toBeUndefined();
+    expect(moonshot.models[0]?.litellmPolicy?.suppressReasoningVisibility).toBe(true);
+    expect(azure.models[0]?.litellmPolicy?.suppressReasoningVisibility === true).toBe(false);
   });
 
   it("does not reuse route evidence after metadata fallback", async () => {
@@ -2205,7 +2378,1144 @@ describe("discoverModels via /model/info", () => {
     fallback = true;
     const result = await discoverModels("https://litellm.example.com", "sk-test", { modelsDev: false });
 
-    expect(result.models[0]?.suppressReasoningContent).toBeUndefined();
+    expect(result.models[0]?.litellmPolicy?.suppressReasoningVisibility === true).toBe(false);
+  });
+  it("uses models.dev reasoning options for an Azure GPT-5 deployment", async () => {
+    vi.resetModules();
+    const { discoverModels: isolatedDiscoverModels } = await import("../src/discover.js");
+    mockEndpoints({
+      "/model/info": () =>
+        jsonResponse(200, {
+          data: [
+            {
+              model_name: "azure-gpt-5",
+              litellm_params: { model: "azure/gpt-5", allowed_openai_params: ["reasoning_effort"] },
+              model_info: { id: "one", mode: "chat", litellm_provider: "azure", supports_reasoning: true },
+            },
+          ],
+        }),
+      "models.dev/api.json": () =>
+        jsonResponse(200, {
+          azure: {
+            models: {
+              "gpt-5": { reasoning_options: { type: "effort", values: ["minimal", "low", "medium", "high"] } },
+              "gpt-5-adapter": { reasoning_options: { type: "effort", values: ["low", "high"] } },
+            },
+          },
+        }),
+    });
+
+    const result = await isolatedDiscoverModels("https://litellm.example.com", "sk-test", {
+      modelsDevCachePath: join(await mkdtemp(join(agentDir, "public-efforts-")), "models-dev.json"),
+    });
+
+    expect(result.models[0]?.thinkingLevelMap).toEqual({
+      off: null,
+      minimal: "minimal",
+      low: "low",
+      medium: "medium",
+      high: "high",
+      xhigh: null,
+      max: null,
+    });
+  });
+
+  it("uses the adapter as the public-catalog lookup provider when backend identity has none", async () => {
+    vi.resetModules();
+    const { discoverModels: isolatedDiscoverModels } = await import("../src/discover.js");
+    mockEndpoints({
+      "/model/info": () =>
+        jsonResponse(200, {
+          data: [
+            {
+              model_name: "azure-gpt-5",
+              litellm_params: { model: "gpt-5-adapter", allowed_openai_params: ["reasoning_effort"] },
+              model_info: { id: "one", mode: "chat", litellm_provider: "azure", supports_reasoning: true },
+            },
+          ],
+        }),
+      "models.dev/api.json": () =>
+        jsonResponse(200, {
+          azure: {
+            models: { "gpt-5-adapter": { reasoning_options: { type: "effort", values: ["low", "high"] } } },
+          },
+        }),
+    });
+
+    const result = await isolatedDiscoverModels("https://litellm.example.com", "sk-test", {
+      modelsDevCachePath: join(await mkdtemp(join(agentDir, "public-efforts-")), "models-dev.json"),
+    });
+
+    expect(result.models[0]?.thinkingLevelMap).toEqual({
+      off: null,
+      minimal: null,
+      low: "low",
+      medium: null,
+      high: "high",
+      xhigh: null,
+      max: null,
+    });
+  });
+
+  it.each(["azure", "azure_ai"])(
+    "uses custom %s authority for public reasoning efforts over a generic adapter",
+    async (customProvider) => {
+      vi.resetModules();
+      const { discoverModels: isolatedDiscoverModels } = await import("../src/discover.js");
+      mockEndpoints({
+        "/model/info": () =>
+          jsonResponse(200, {
+            data: [
+              {
+                model_name: "custom-azure-route",
+                litellm_params: {
+                  model: "gpt-5-adapter",
+                  custom_llm_provider: customProvider,
+                  allowed_openai_params: ["reasoning_effort"],
+                },
+                model_info: { mode: "chat", litellm_provider: "openai", supports_reasoning: true },
+              },
+            ],
+          }),
+        "models.dev/api.json": () =>
+          jsonResponse(200, {
+            azure: { models: { "gpt-5-adapter": { reasoning_options: { type: "effort", values: ["low", "high"] } } } },
+            openai: {
+              models: { "gpt-5-adapter": { reasoning_options: { type: "effort", values: ["minimal", "high"] } } },
+            },
+          }),
+      });
+
+      const result = await isolatedDiscoverModels("https://litellm.example.com", "sk-test", {
+        modelsDevCachePath: join(await mkdtemp(join(agentDir, "public-efforts-")), "models-dev.json"),
+      });
+
+      expect(result.models[0]).toMatchObject({
+        api: "openai-responses",
+        thinkingLevelMap: { off: null, minimal: null, low: "low", medium: null, high: "high", xhigh: null, max: null },
+      });
+    },
+  );
+
+  it("ignores malformed accepted-parameter arrays without dropping healthy models", async () => {
+    mockEndpoints({
+      "/model/info": () =>
+        jsonResponse(200, {
+          data: [
+            {
+              model_name: "malformed",
+              litellm_params: { model: "internal/malformed", allowed_openai_params: 7 },
+              model_info: { id: "bad", mode: "chat", supported_openai_params: {} },
+            },
+            {
+              model_name: "healthy-route",
+              litellm_params: { model: "openai/gpt-4o" },
+              model_info: { id: "good", mode: "chat" },
+            },
+          ],
+        }),
+    });
+
+    const result = await discoverModels("https://litellm.example.com", "sk-test", {});
+
+    expect(result.models.map((model) => model.id)).toContain("healthy-route");
+  });
+
+  it("uses custom_llm_provider authority for catalog metadata and the Chat carrier", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      jsonResponse(200, {
+        data: [
+          {
+            model_name: "private/kimi-route",
+            litellm_params: {
+              model: "kimi-k2.6",
+              custom_llm_provider: "moonshot",
+              allowed_openai_params: ["thinking"],
+            },
+            model_info: { mode: "chat", supports_reasoning: true },
+          },
+        ],
+      }),
+    );
+
+    const result = await discoverModels("https://litellm.example.com", "sk-test", {});
+
+    expect(result.models[0]).toMatchObject({
+      id: "private/kimi-route",
+      name: "private/kimi-route",
+      input: ["text", "image"],
+      cost: { input: 0.95, output: 4, cacheRead: 0.16, cacheWrite: 0 },
+      contextWindow: 262_144,
+      maxTokens: 262_144,
+      reasoning: true,
+      thinkingLevelMap: {
+        off: "off",
+        minimal: null,
+        low: null,
+        medium: null,
+        high: "high",
+        xhigh: null,
+        max: null,
+      },
+      compat: { thinkingFormat: "deepseek", supportsReasoningEffort: false },
+    });
+  });
+
+  it("prefers custom_llm_provider over a generic adapter for catalog lookup", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      jsonResponse(200, {
+        data: [
+          {
+            model_name: "kimi-route",
+            litellm_params: { model: "kimi-k2.5", custom_llm_provider: "moonshot" },
+            model_info: { litellm_provider: "openai", mode: "chat" },
+          },
+          {
+            model_name: "moonshot-control",
+            litellm_params: { model: "kimi-k2.5" },
+            model_info: { litellm_provider: "moonshot", mode: "chat" },
+          },
+        ],
+      }),
+    );
+
+    const result = await discoverModels("https://litellm.example.com", "sk-test", {});
+
+    for (const id of ["kimi-route", "moonshot-control"]) {
+      expect(result.models.find((model) => model.id === id)).toMatchObject({
+        id,
+        name: id,
+        contextWindow: 262_144,
+        maxTokens: 262_144,
+        cost: { input: 0.6, output: 3, cacheRead: 0.1, cacheWrite: 0 },
+      });
+    }
+  });
+
+  it("derives Gemini normalization from adapter evidence for an opaque route", async () => {
+    mockEndpoints({
+      "/model/info": () =>
+        jsonResponse(200, {
+          data: [
+            {
+              model_name: "internal/prod-route",
+              litellm_params: { model: "internal/opaque" },
+              model_info: { id: "a", mode: "chat", litellm_provider: "gemini" },
+            },
+          ],
+        }),
+    });
+
+    const result = await discoverModels("https://litellm.example.com", "sk-test", {});
+
+    expect(result.models[0]?.litellmPolicy?.normalizeGeminiReasoningEffort).toBe(true);
+  });
+
+  it("withholds Gemini normalization when deployment family evidence is mixed", async () => {
+    mockEndpoints({
+      "/model/info": () =>
+        jsonResponse(200, {
+          data: [
+            {
+              model_name: "gemini-looking-route",
+              litellm_params: { model: "gemini/gemini-3.1-pro-preview" },
+              model_info: { id: "a", mode: "chat", litellm_provider: "gemini" },
+            },
+            {
+              model_name: "gemini-looking-route",
+              litellm_params: { model: "openai/gpt-4o" },
+              model_info: { id: "b", mode: "chat", litellm_provider: "openai" },
+            },
+          ],
+        }),
+    });
+
+    const result = await discoverModels("https://litellm.example.com", "sk-test", {});
+
+    expect(result.models[0]?.litellmPolicy).toBeUndefined();
+  });
+
+  it("does not use a qualified singleton public route as catalog authority", async () => {
+    mockEndpoints({
+      "/model/info": () =>
+        jsonResponse(200, {
+          data: [{ model_name: "openai/gpt-5.5", model_info: { id: "one", mode: "chat" } }],
+        }),
+    });
+
+    const result = await discoverModels("https://litellm.example.com", "sk-test", {});
+
+    expect(result.models[0]).toMatchObject({
+      id: "openai/gpt-5.5",
+      name: "openai/gpt-5.5 (incomplete metadata)",
+      reasoning: false,
+      input: ["text"],
+      contextWindow: 128_000,
+      maxTokens: 16_384,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    });
+    expect(result.models[0]).not.toHaveProperty("thinkingLevelMap");
+  });
+
+  it.each([
+    ["opaque backend model", { litellm_params: { model: "internal/mystery" }, model_info: {} }],
+    ["opaque base model", { model_info: { base_model: "internal/mystery" } }],
+    ["unresolved adapter", { model_info: { litellm_provider: "custom_proxy" } }],
+  ])("withholds route-text catalog metadata for a singleton with %s evidence", async (_case, evidence) => {
+    mockEndpoints({
+      "/model/info": () =>
+        jsonResponse(200, {
+          data: [
+            {
+              model_name: "openai/gpt-5.5",
+              ...evidence,
+              model_info: { ...evidence.model_info, id: "only", mode: "chat" },
+            },
+          ],
+        }),
+    });
+
+    const result = await discoverModels("https://litellm.example.com", "sk-test", {});
+
+    expect(result.models[0]).toMatchObject({
+      id: "openai/gpt-5.5",
+      name: "openai/gpt-5.5 (incomplete metadata)",
+      reasoning: false,
+      input: ["text"],
+      contextWindow: 128_000,
+      maxTokens: 16_384,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    });
+    expect(result.models[0]).not.toHaveProperty("thinkingLevelMap");
+  });
+
+  it.each(["openai", "custom_openai", "openai_like", "text-completion-openai", "azure", "azure_ai"])(
+    "treats the %s adapter as transport when the model identifies Kimi",
+    async (adapter) => {
+      mockEndpoints({
+        "/model/info": () =>
+          jsonResponse(200, {
+            data: [
+              {
+                model_name: "kimi-route",
+                litellm_params: { model: "openai/kimi-k2.5", allowed_openai_params: ["thinking"] },
+                model_info: { mode: "chat", litellm_provider: adapter, supports_reasoning: true },
+              },
+            ],
+          }),
+      });
+      const result = await discoverModels("https://litellm.example.com", "sk-test", { modelsDev: false });
+      expect(result.models[0]).toMatchObject({
+        compat: { thinkingFormat: "deepseek", supportsReasoningEffort: false },
+        litellmPolicy: {
+          normalizeStrictToolMessages: true,
+          normalizeThinkTags: true,
+          suppressReasoningVisibility: true,
+        },
+      });
+    },
+  );
+
+  it.each(["kimi-proxy/gpt-4-turbo", "kimi-k2.5-proxy/gpt-4-turbo"])(
+    "ignores family and generation words in unknown backend provider %s",
+    async (model) => {
+      mockEndpoints({
+        "/model/info": () =>
+          jsonResponse(200, {
+            data: [
+              {
+                model_name: "opaque",
+                litellm_params: { model },
+                model_info: {
+                  mode: "chat",
+                  supported_endpoints: ["/v1/chat/completions"],
+                  supports_reasoning: true,
+                  supported_openai_params: ["thinking"],
+                },
+              },
+            ],
+          }),
+      });
+
+      const { models } = await discoverModels("https://litellm.example.com", "sk-test", { modelsDev: false });
+
+      expect(models).toHaveLength(1);
+      expect(models[0]).toMatchObject({ api: "openai-completions", litellmBackendFamily: "openai" });
+      expect(models[0]?.compat).toEqual({ supportsStore: false });
+      expect(models[0]?.thinkingLevelMap).toEqual(NO_REASONING_LEVELS);
+      expect(models[0]).not.toHaveProperty("litellmPolicy");
+    },
+  );
+
+  it("publishes Kimi compatibility when an OpenAI transport adapter routes openai/kimi", async () => {
+    mockEndpoints({
+      "/model/info": () =>
+        jsonResponse(200, {
+          data: [
+            {
+              model_name: "kimi-through-openai",
+              litellm_params: { model: "openai/kimi-k2.5", allowed_openai_params: ["thinking"] },
+              model_info: { id: "kimi-openai", mode: "chat", litellm_provider: "openai", supports_reasoning: true },
+            },
+          ],
+        }),
+    });
+
+    const result = await discoverModels("https://litellm.example.com", "sk-test", {});
+
+    expect(result.models[0]).toMatchObject({
+      id: "kimi-through-openai",
+      reasoning: true,
+      compat: {
+        supportsStore: false,
+        supportsDeveloperRole: false,
+        supportsReasoningEffort: false,
+        supportsStrictMode: false,
+        maxTokensField: "max_tokens",
+      },
+      litellmPolicy: {
+        normalizeStrictToolMessages: true,
+        normalizeThinkTags: true,
+        suppressReasoningVisibility: true,
+      },
+    });
+  });
+
+  it("applies Kimi policy from a Moonshot custom provider with an opaque model", async () => {
+    mockEndpoints({
+      "/model/info": () =>
+        jsonResponse(200, {
+          data: [
+            {
+              model_name: "opaque-kimi-route",
+              litellm_params: { model: "opaque-model", custom_llm_provider: "moonshot" },
+              model_info: { id: "kimi-custom-provider", mode: "chat" },
+            },
+          ],
+        }),
+    });
+
+    const result = await discoverModels("https://litellm.example.com", "sk-test", {});
+
+    expect(result.models[0]?.litellmPolicy).toEqual({
+      normalizeStrictToolMessages: true,
+      normalizeThinkTags: true,
+      suppressReasoningVisibility: true,
+    });
+  });
+
+  it.each(["openai", "custom_openai", "openai_like", "text-completion-openai", "azure", "azure_ai"])(
+    "keeps unknown catalog metadata unresolved through the %s adapter",
+    (adapter) => {
+      expect(
+        resolveModelInfoCatalog({
+          model_name: "opaque-route",
+          litellm_params: { model: "internal/model" },
+          model_info: { mode: "chat", litellm_provider: adapter },
+        }),
+      ).toMatchObject({ provider: "internal", catalogModelId: "internal/model" });
+    },
+  );
+
+  it("keeps provider identity from the backend candidate that resolves", () => {
+    expect(
+      resolveModelInfoCatalog({
+        model_name: "mixed-evidence",
+        litellm_params: { model: "internal/claude-magic" },
+        model_info: { mode: "chat", base_model: "openai/gpt-4o" },
+      }),
+    ).toMatchObject({ provider: "openai" });
+
+    expect(
+      resolveModelInfoCatalog({
+        model_name: "aliased",
+        litellm_params: { model: "anthropic/opus-4-7" },
+        model_info: { mode: "chat" },
+      }),
+    ).toMatchObject({ provider: "anthropic" });
+  });
+
+  it.each([
+    {
+      name: "routing model conflicts with base model",
+      entry: {
+        model_name: "conflicting-models",
+        litellm_params: { model: "openai/gpt-4o" },
+        model_info: { mode: "chat", base_model: "anthropic/claude-sonnet-4-6" },
+      },
+    },
+    {
+      name: "adapter conflicts with the qualified model",
+      entry: {
+        model_name: "conflicting-adapter",
+        litellm_params: { model: "openai/gpt-4o" },
+        model_info: { mode: "chat", litellm_provider: "anthropic" },
+      },
+    },
+  ])("retains catalog authority independently of family disagreement for $name", ({ entry }) => {
+    expect(resolveModelInfoCatalog(entry)).toMatchObject({
+      provider: entry.model_info.base_model ? "anthropic" : "openai",
+    });
+  });
+
+  it("retains the qualified catalog identity despite a different adapter family", () => {
+    expect(
+      resolveModelInfoCatalog({
+        model_name: "specific-adapter-conflict",
+        litellm_params: { model: "openai/kimi-k2.5" },
+        model_info: { mode: "chat", litellm_provider: "anthropic" },
+      }),
+    ).toMatchObject({ provider: "openai", catalogModelId: "openai/kimi-k2.5" });
+  });
+
+  it.each([
+    ["routing then base", "openai/gpt-4o", "openai/o3"],
+    ["base then routing", "openai/o3", "openai/gpt-4o"],
+  ])("uses base_model catalog authority when configured models differ in %s order", (_case, routing, base) => {
+    const result = resolveModelInfoCatalog({
+      model_name: "conflicting-openai-models",
+      litellm_params: { model: routing },
+      model_info: { mode: "chat", litellm_provider: "openai", base_model: base },
+    });
+
+    expect(result).toMatchObject({ provider: "openai", catalogModelId: base.slice("openai/".length) });
+  });
+
+  it.each([
+    "moonshot/kimi-k2.7",
+    "moonshot/kimi-k2.7-instruct",
+    "moonshot/kimi-k2.7-codec",
+    "moonshot/kimi-k2.7-highspeedy",
+  ])("does not classify K2.7 without an exact Code suffix: %s", async (model) => {
+    mockEndpoints({
+      "/model/info": () =>
+        jsonResponse(200, {
+          data: [
+            {
+              model_name: "unknown-k2.7-variant",
+              litellm_params: { model, allowed_openai_params: ["thinking"] },
+              model_info: { mode: "chat", supports_reasoning: true },
+            },
+          ],
+        }),
+    });
+    const result = await discoverModels("https://litellm.example.com", "sk-test", { modelsDev: false });
+    expect(result.models[0]?.thinkingLevelMap).toEqual(NO_REASONING_LEVELS);
+    expect(result.models[0]?.compat).not.toHaveProperty("thinkingFormat");
+  });
+
+  it.each(["moonshot/kimi-k2.7-code", "moonshot/kimi-k2.7_highspeed", "moonshot/kimi-k2.7.code"])(
+    "classifies the supported K2.7 Code suffix: %s",
+    async (model) => {
+      mockEndpoints({
+        "/model/info": () =>
+          jsonResponse(200, {
+            data: [
+              {
+                model_name: "known-k2.7-variant",
+                litellm_params: { model, allowed_openai_params: ["thinking"] },
+                model_info: { mode: "chat", supports_reasoning: true },
+              },
+            ],
+          }),
+      });
+      const result = await discoverModels("https://litellm.example.com", "sk-test", { modelsDev: false });
+      expect(result.models[0]).toMatchObject({
+        thinkingLevelMap: { off: null, minimal: null, low: null, medium: null, high: "high", xhigh: null, max: null },
+        compat: { thinkingFormat: "deepseek", supportsReasoningEffort: false },
+      });
+    },
+  );
+
+  it("publishes base_model catalog metadata when configured models differ within one deployment", async () => {
+    const rows = [
+      {
+        model_name: "one-conflicted-openai-deployment",
+        litellm_params: { model: "openai/gpt-4o" },
+        model_info: { id: "one", mode: "chat", litellm_provider: "openai", base_model: "openai/o3" },
+      },
+      {
+        model_name: "one-conflicted-openai-deployment",
+        litellm_params: { model: "openai/o3" },
+        model_info: { id: "one", mode: "chat", litellm_provider: "openai", base_model: "openai/gpt-4o" },
+      },
+    ];
+    for (const data of rows) {
+      mockEndpoints({ "/model/info": () => jsonResponse(200, { data: [data] }) });
+      const result = await discoverModels("https://litellm.example.com", "sk-test", {});
+
+      const catalog = getModel("openai", data.model_info.base_model.slice("openai/".length) as "o3" | "gpt-4o");
+      expect(result.models[0]).toMatchObject({
+        name: "one-conflicted-openai-deployment",
+        reasoning: catalog.reasoning,
+        input: catalog.input,
+        contextWindow: catalog.contextWindow,
+        maxTokens: catalog.maxTokens,
+        cost: catalog.cost,
+      });
+      if (catalog.reasoning) expect(result.models[0]?.thinkingLevelMap).toEqual(NO_REASONING_LEVELS);
+      else expect(result.models[0]).not.toHaveProperty("thinkingLevelMap");
+    }
+  });
+
+  it("uses base_model metadata while withholding conflicting provider family policy", async () => {
+    mockEndpoints({
+      "/model/info": () =>
+        jsonResponse(200, {
+          data: [
+            {
+              model_name: "one-conflicted-deployment",
+              litellm_params: { model: "openai/gpt-4o" },
+              model_info: { id: "one", mode: "chat", base_model: "anthropic/claude-sonnet-4-6" },
+            },
+          ],
+        }),
+    });
+
+    const result = await discoverModels("https://litellm.example.com", "sk-test", {});
+
+    const catalog = getModel("anthropic", "claude-sonnet-4-6");
+    expect(result.models[0]).toMatchObject({
+      name: "one-conflicted-deployment",
+      reasoning: catalog.reasoning,
+      input: catalog.input,
+      contextWindow: catalog.contextWindow,
+      maxTokens: catalog.maxTokens,
+      cost: catalog.cost,
+      thinkingLevelMap: NO_REASONING_LEVELS,
+    });
+    expect(result.models[0]).not.toHaveProperty("litellmPolicy");
+  });
+
+  it("does not restore route-name Kimi policy after an intra-row authority conflict", async () => {
+    const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+    mockEndpoints({
+      "/model/info": () =>
+        jsonResponse(200, {
+          data: [
+            {
+              model_name: "kimi-k2.6-vanity",
+              litellm_params: { model: "openai/gpt-4o" },
+              model_info: { id: "one", mode: "chat", base_model: "anthropic/claude-sonnet-4-6" },
+            },
+          ],
+        }),
+    });
+
+    const result = await discoverModels("https://litellm.example.com", "sk-test", {});
+
+    expect(result.models[0]).toMatchObject({
+      id: "kimi-k2.6-vanity",
+      reasoning: true,
+      thinkingLevelMap: NO_REASONING_LEVELS,
+    });
+    expect(result.models[0]?.compat).not.toHaveProperty("requiresReasoningContentOnAssistantMessages");
+    expect(result.models[0]).not.toHaveProperty("litellmPolicy");
+    expect(stderr.mock.calls.flat().join(" ")).not.toContain("strict tool-message repair is withheld");
+  });
+
+  it("retains public effort evidence while withholding conflicting family policy", async () => {
+    vi.resetModules();
+    const { discoverModels: isolatedDiscoverModels } = await import("../src/discover.js");
+    mockEndpoints({
+      "/model/info": () =>
+        jsonResponse(200, {
+          data: [
+            {
+              model_name: "conflicting-family-hit",
+              litellm_params: { model: "openai/private-gpt", allowed_openai_params: ["reasoning_effort"] },
+              model_info: {
+                id: "one",
+                mode: "chat",
+                litellm_provider: "openai",
+                base_model: "openai/kimi-k2.5",
+                supports_reasoning: true,
+              },
+            },
+          ],
+        }),
+      "models.dev/api.json": () =>
+        jsonResponse(200, {
+          openai: {
+            models: {
+              "kimi-k2.5": { reasoning_options: { type: "effort", values: ["low", "medium", "high"] } },
+            },
+          },
+        }),
+    });
+
+    const result = await isolatedDiscoverModels("https://litellm.example.com", "sk-test", {
+      modelsDevCachePath: join(await mkdtemp(join(agentDir, "conflicting-efforts-")), "models-dev.json"),
+    });
+
+    expect(result.models[0]).toMatchObject({
+      id: "conflicting-family-hit",
+      reasoning: true,
+      compat: { supportsStore: false },
+    });
+    expect(result.models[0]?.compat).not.toHaveProperty("cacheControlFormat");
+    expect(result.models[0]?.thinkingLevelMap).toEqual({
+      off: null,
+      minimal: null,
+      low: "low",
+      medium: "medium",
+      high: "high",
+      xhigh: null,
+      max: null,
+    });
+    expect(result.models[0]).not.toHaveProperty("litellmPolicy");
+  });
+
+  it("applies Anthropic cache compatibility to a Fable-backed alias", async () => {
+    mockEndpoints({
+      "/model/info": () =>
+        jsonResponse(200, {
+          data: [
+            {
+              model_name: "team-writer",
+              litellm_params: { model: "bedrock/fable-5" },
+              model_info: { id: "one", mode: "chat" },
+            },
+          ],
+        }),
+    });
+
+    const result = await discoverModels("https://litellm.example.com", "sk-test", {});
+
+    expect(result.models[0]).toMatchObject({
+      id: "team-writer",
+      compat: { supportsStore: false, cacheControlFormat: "anthropic" },
+    });
+  });
+
+  it("applies Anthropic cache compatibility to an evidence-free Fable route", async () => {
+    mockEndpoints({
+      "/model/info": () =>
+        jsonResponse(200, {
+          data: [{ model_name: "team-fable-5", model_info: { id: "one", mode: "chat" } }],
+        }),
+    });
+
+    const result = await discoverModels("https://litellm.example.com", "sk-test", {});
+
+    expect(result.models[0]).toMatchObject({
+      id: "team-fable-5",
+      compat: { supportsStore: false, cacheControlFormat: "anthropic" },
+    });
+  });
+
+  it("classifies a Codex deployment identity as OpenAI", () => {
+    expect(
+      resolveModelInfoCatalog({
+        model_name: "codex-route",
+        litellm_params: { model: "azure/codex-mini" },
+        model_info: { mode: "chat" },
+      }),
+    ).toMatchObject({ provider: "openai", catalogModelId: "codex-mini" });
+  });
+
+  it("does not enrich an unqualified route from an unrelated provider catalog", async () => {
+    mockEndpoints({
+      "/model/info": () => jsonResponse(200, { data: [{ model_name: "gpt-4o", model_info: { mode: "chat" } }] }),
+    });
+
+    const result = await discoverModels("https://litellm.example.com", "sk-test", {});
+
+    expect(result.models[0]).toMatchObject({
+      id: "gpt-4o",
+      name: "gpt-4o (incomplete metadata)",
+      reasoning: false,
+      input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 128000,
+      maxTokens: 16384,
+    });
+  });
+
+  it("diagnoses conflicting provider evidence within one deployment", async () => {
+    const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+    mockEndpoints({
+      "/model/info": () =>
+        jsonResponse(200, {
+          data: [
+            {
+              model_name: "conflicting-authority",
+              litellm_params: { model: "openai/gpt-4o", custom_llm_provider: "anthropic" },
+              model_info: { id: "one", mode: "chat" },
+            },
+          ],
+        }),
+    });
+
+    const result = await discoverModels("https://litellm.example.com", "sk-test", {});
+
+    expect(result.models[0]).toMatchObject({
+      name: "conflicting-authority (incomplete metadata)",
+      reasoning: false,
+    });
+    expect(stderr.mock.calls.flat().join(" ")).toContain("conflicting-authority");
+  });
+
+  it("applies complete Moonshot compat to a vanity route from unanimous deployment evidence", async () => {
+    mockEndpoints({
+      "/model/info": () =>
+        jsonResponse(200, {
+          data: [
+            {
+              model_name: "internal/prod-chat",
+              litellm_params: { model: "MoOnShOt/KiMi-K2.6" },
+              model_info: { id: "one", mode: "chat" },
+            },
+          ],
+        }),
+    });
+
+    const result = await discoverModels("https://litellm.example.com", "sk-test", {});
+
+    expect(result.models[0]?.compat).toEqual({
+      supportsStore: false,
+      supportsDeveloperRole: false,
+      supportsReasoningEffort: false,
+      supportsStrictMode: false,
+      maxTokensField: "max_tokens",
+    });
+    expect(result.models[0]?.litellmPolicy?.normalizeStrictToolMessages).toBe(true);
+  });
+
+  it("keeps strict repair but withholds visibility suppression for mixed Kimi thinking modes", async () => {
+    mockEndpoints({
+      "/model/info": () =>
+        jsonResponse(200, {
+          data: [
+            {
+              model_name: "mixed-kimi-mode-route",
+              litellm_params: { model: "moonshot/kimi-k2.6" },
+              model_info: { id: "normal", mode: "chat" },
+            },
+            {
+              model_name: "mixed-kimi-mode-route",
+              litellm_params: { model: "moonshot/kimi-k2-thinking" },
+              model_info: { id: "thinking", mode: "chat" },
+            },
+          ],
+        }),
+    });
+
+    const result = await discoverModels("https://litellm.example.com", "sk-test", {});
+
+    expect(result.models[0]?.litellmPolicy).toEqual({
+      normalizeStrictToolMessages: true,
+      normalizeThinkTags: false,
+      suppressReasoningVisibility: false,
+    });
+  });
+
+  it("withholds strict tool repair for partial Moonshot evidence and reports a vanity route", async () => {
+    const writes: string[] = [];
+    vi.spyOn(process.stderr, "write").mockImplementation((chunk) => {
+      writes.push(String(chunk));
+      return true;
+    });
+    mockEndpoints({
+      "/model/info": () =>
+        jsonResponse(200, {
+          data: [
+            {
+              model_name: "internal/mixed-tool-route",
+              litellm_params: { model: "moonshot/kimi-k2.6" },
+              model_info: { id: "a", mode: "chat" },
+            },
+            {
+              model_name: "internal/mixed-tool-route",
+              litellm_params: { model: "internal/opaque" },
+              model_info: { id: "b", mode: "chat" },
+            },
+          ],
+        }),
+    });
+
+    const result = await discoverModels("https://litellm.example.com", "sk-test", {});
+
+    expect(result.models[0]?.litellmPolicy).toMatchObject({
+      normalizeStrictToolMessages: false,
+      normalizeThinkTags: false,
+    });
+    expect(writes.filter((line) => line.includes("strict tool-message repair is withheld"))).toHaveLength(1);
+    expect(writes.join("\n")).toContain("internal/mixed-tool-route");
+  });
+
+  it("denies Chat reasoning levels without an accepted carrier", async () => {
+    mockEndpoints({
+      "/model/info": () =>
+        jsonResponse(200, {
+          data: [
+            {
+              model_name: "opaque-chat-reasoner",
+              litellm_params: { model: "internal/reasoner" },
+              model_info: { id: "one", mode: "chat", supports_reasoning: true },
+            },
+          ],
+        }),
+    });
+
+    const result = await discoverModels("https://litellm.example.com", "sk-test", {});
+
+    expect(result.models[0]).toMatchObject({ api: "openai-completions", reasoning: true });
+    expect(result.models[0]?.thinkingLevelMap).toEqual({
+      off: null,
+      minimal: null,
+      low: null,
+      medium: null,
+      high: null,
+      xhigh: null,
+      max: null,
+    });
+  });
+
+  it("denies Responses reasoning levels when the only accepted control is Chat thinking", async () => {
+    mockEndpoints({
+      "/model/info": () =>
+        jsonResponse(200, {
+          data: [
+            {
+              model_name: "thinking-only-responses",
+              litellm_params: { model: "moonshot/kimi-k2.6", allowed_openai_params: ["thinking"] },
+              model_info: { id: "one", mode: "responses", supports_reasoning: true },
+            },
+          ],
+        }),
+    });
+
+    const result = await discoverModels("https://litellm.example.com", "sk-test", {});
+
+    expect(result.models[0]).toMatchObject({ api: "openai-responses", reasoning: true });
+    expect(result.models[0]?.thinkingLevelMap).toEqual({
+      off: null,
+      minimal: null,
+      low: null,
+      medium: null,
+      high: null,
+      xhigh: null,
+      max: null,
+    });
+    expect(result.models[0]).not.toHaveProperty("litellmResponsesReasoningControl");
+  });
+
+  it("denies Responses reasoning levels unless every deployment accepts reasoning_effort", async () => {
+    const deployments = [
+      {
+        model_name: "mixed-control-responses",
+        litellm_params: { model: "moonshot/kimi-k2.6", allowed_openai_params: ["reasoning_effort", "thinking"] },
+        model_info: { id: "effort", mode: "responses", supports_reasoning: true },
+      },
+      {
+        model_name: "mixed-control-responses",
+        litellm_params: { model: "moonshot/kimi-k2.6", allowed_openai_params: ["thinking"] },
+        model_info: { id: "thinking", mode: "responses", supports_reasoning: true },
+      },
+    ];
+    const fetchMock = vi.spyOn(globalThis, "fetch");
+    for (const rows of [deployments, [...deployments].reverse()]) {
+      fetchMock.mockResolvedValueOnce(jsonResponse(200, { data: rows }));
+      const result = await discoverModels("https://litellm.example.com", "sk-test", {});
+
+      expect(result.models[0]).toMatchObject({ api: "openai-responses", reasoning: true });
+      expect(result.models[0]?.thinkingLevelMap).toEqual({
+        off: null,
+        minimal: null,
+        low: null,
+        medium: null,
+        high: null,
+        xhigh: null,
+        max: null,
+      });
+      expect(result.models[0]).not.toHaveProperty("litellmResponsesReasoningControl");
+    }
+  });
+
+  it("preserves accepted Responses reasoning control through cached enrichment", async () => {
+    mockEndpoints({
+      "/model/info": () =>
+        jsonResponse(200, {
+          data: [
+            {
+              model_name: "effort-responses",
+              litellm_params: { model: "moonshot/kimi-k3", allowed_openai_params: ["reasoning_effort"] },
+              model_info: { id: "one", mode: "responses", supports_reasoning: true },
+            },
+          ],
+        }),
+    });
+
+    const result = await discoverModels("https://litellm.example.com", "sk-test", {});
+    const model = result.models[0];
+
+    expect(model).toMatchObject({ api: "openai-responses", litellmResponsesReasoningControl: true });
+    expect(model?.thinkingLevelMap).toMatchObject({ low: "low", high: "high", max: null });
+    expect(model && enrichCachedModel(model as never).thinkingLevelMap).toEqual(model?.thinkingLevelMap);
+  });
+
+  it("keeps a Responses-mode deployment on Responses when discovered through /health", async () => {
+    mockEndpoints({
+      "/model/info?litellm_model_id=uuid-1": () =>
+        jsonResponse(200, {
+          data: [
+            {
+              model_name: "responses-route",
+              litellm_params: { model: "openai/gpt-5.5" },
+              model_info: { id: "uuid-1", mode: "responses" },
+            },
+          ],
+        }),
+      "/model/info": () => jsonResponse(403, {}),
+      "/v1/models": () => jsonResponse(404, {}),
+      "/health": () => jsonResponse(200, { healthy_endpoints: [{ model: "openai/gpt-5.5", model_id: "uuid-1" }] }),
+    });
+
+    const result = await discoverModels("https://litellm.example.com", "sk-test", {});
+
+    expect(result.source).toBe("health");
+    expect(result.models[0]).toMatchObject({ id: "responses-route", api: "openai-responses" });
+  });
+
+  it("falls back to the health route name when a deployment row's own name is unreadable", async () => {
+    // The detail row's `model_name` is unusable, but `/health` named the route, so the
+    // model must survive under that name rather than being discarded.
+    mockEndpoints({
+      "/model/info?litellm_model_id=uuid-1": () =>
+        jsonResponse(200, { data: [{ model_name: 7, model_info: { mode: "chat" } }] }),
+      "/model/info": () => jsonResponse(403, {}),
+      "/v1/models": () => jsonResponse(404, {}),
+      "/health": () => jsonResponse(200, { healthy_endpoints: [{ model: "named-route", model_id: "uuid-1" }] }),
+    });
+
+    const result = await discoverModels("https://litellm.example.com", "sk-test", {});
+
+    expect(result.source).toBe("health");
+    expect(result.models.map((model) => model.id)).toEqual(["named-route"]);
+  });
+
+  it("preserves route-only Kimi think-tag policy without enabling request controls", async () => {
+    mockEndpoints({
+      "/model/info": () =>
+        jsonResponse(200, {
+          data: [{ model_name: "kimi-k2.6", model_info: { id: "only", mode: "chat" } }],
+        }),
+    });
+
+    const result = await discoverModels("https://litellm.example.com", "sk-test", {});
+
+    expect(result.models[0]).toMatchObject({
+      litellmPolicy: {
+        normalizeStrictToolMessages: false,
+        normalizeThinkTags: true,
+        suppressReasoningVisibility: false,
+      },
+    });
+    expect(result.models[0]?.reasoning).toBe(false);
+    expect(result.models[0]).not.toHaveProperty("thinkingLevelMap");
+    expect(result.models[0]?.compat).toMatchObject({ supportsReasoningEffort: false });
+  });
+
+  it("does not use a public route name as evidence for conflicting duplicate deployment ids", async () => {
+    // One deployment id with two disagreeing backends is not a single deployment,
+    // so the catalog-resolvable route name must not enrich the group.
+    mockEndpoints({
+      "/model/info": () =>
+        jsonResponse(200, {
+          data: [
+            { model_name: "openai/gpt-5.5", model_info: { id: "same", mode: "chat" } },
+            {
+              model_name: "openai/gpt-5.5",
+              model_info: { id: "same", mode: "chat", max_input_tokens: 64_000 },
+              litellm_params: { model: "internal/mystery" },
+            },
+          ],
+        }),
+    });
+
+    const result = await discoverModels("https://litellm.example.com", "sk-test", {});
+
+    expect(result.models[0]).toMatchObject({
+      id: "openai/gpt-5.5",
+      name: "openai/gpt-5.5 (incomplete metadata)",
+      reasoning: false,
+      input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      maxTokens: 16_384,
+    });
+    expect(result.models[0]).not.toHaveProperty("thinkingLevelMap");
+  });
+
+  it.each([
+    ["chat first", "chat", "embedding"],
+    ["embedding first", "embedding", "chat"],
+    ["Responses first", "responses", "embedding"],
+    ["embedding before Responses", "embedding", "responses"],
+  ])(
+    "withholds and diagnoses a mixed chat-style and incompatible route with $0",
+    async (caseName, firstMode, secondMode) => {
+      const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+      const route = `mixed-route-${caseName.replaceAll(" ", "-")}`;
+      mockEndpoints({
+        "/model/info": () =>
+          jsonResponse(200, {
+            data: [
+              { model_name: route, model_info: { id: "first", mode: firstMode } },
+              { model_name: route, model_info: { id: "second", mode: secondMode } },
+            ],
+          }),
+      });
+
+      const result = await discoverModels("https://litellm.example.com", "sk-test", {});
+
+      expect(result.models).toEqual([]);
+      expect(stderr).toHaveBeenCalledTimes(1);
+      expect(String(stderr.mock.calls[0]?.[0])).toContain(
+        "1 route group(s) mix chat-style and explicitly incompatible deployment modes",
+      );
+      expect(String(stderr.mock.calls[0]?.[0])).toContain(route);
+    },
+  );
+
+  it("bounds incompatible-mode diagnostics and reports each route once", async () => {
+    const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+    const mixed = (route: string) => [
+      { model_name: route, model_info: { id: `${route}-chat`, mode: "chat" } },
+      { model_name: route, model_info: { id: `${route}-embedding`, mode: "embedding" } },
+    ];
+    const routes = ["bounded-mode-a", "bounded-mode-b", "bounded-mode-c", "bounded-mode-d"];
+    const discover = async () => {
+      mockEndpoints({ "/model/info": () => jsonResponse(200, { data: routes.flatMap(mixed) }) });
+      await discoverModels("https://litellm.example.com", "sk-test", {});
+    };
+
+    await discover();
+    expect(stderr).toHaveBeenCalledTimes(1);
+    expect(String(stderr.mock.calls[0]?.[0])).toContain("bounded-mode-a, bounded-mode-b, bounded-mode-c (+1 more)");
+    expect(String(stderr.mock.calls[0]?.[0])).not.toContain("bounded-mode-d");
+
+    await discover();
+    expect(stderr).toHaveBeenCalledTimes(1);
+  });
+
+  it("stays silent when provider identity is unanimous or wholly unknown", async () => {
+    const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+    mockEndpoints({
+      "/model/info": () =>
+        jsonResponse(200, {
+          data: [
+            { model_name: "agreed", model_info: { id: "a", mode: "chat" }, litellm_params: { model: "openai/gpt-4o" } },
+            { model_name: "agreed", model_info: { id: "b", mode: "chat" }, litellm_params: { model: "openai/gpt-4o" } },
+            { model_name: "unknown", model_info: { id: "c", mode: "chat" }, litellm_params: { model: "internal/x" } },
+            { model_name: "unknown", model_info: { id: "d", mode: "chat" }, litellm_params: { model: "internal/y" } },
+          ],
+        }),
+    });
+
+    await discoverModels("https://litellm.example.com", "sk-test", {});
+
+    expect(stderr).not.toHaveBeenCalled();
   });
 });
 
@@ -2400,9 +3710,9 @@ describe("discoverModels via /health", () => {
   });
 
   it.each([
-    ["Moonshot first", ["moonshot/kimi-k3", "azure_ai/FW-Kimi-K3"]],
-    ["Azure first", ["azure_ai/FW-Kimi-K3", "moonshot/kimi-k3"]],
-  ] as const)("does not suppress duplicate mixed routes when %s", async (_name, routes) => {
+    ["Moonshot first", ["moonshot/kimi-k3", "azure/gpt-4o"]],
+    ["Azure first", ["azure/gpt-4o", "moonshot/kimi-k3"]],
+  ] as const)("does not suppress duplicate routes with different backend families when %s", async (_name, routes) => {
     vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
       const url = String(input);
       if (url.endsWith("/model/info") || url.endsWith("/v1/models")) return jsonResponse(403, {});
@@ -2419,7 +3729,7 @@ describe("discoverModels via /health", () => {
 
     expect(result.source).toBe("health");
     expect(result.models).toHaveLength(1);
-    expect(result.models[0]?.suppressReasoningContent).toBeUndefined();
+    expect(result.models[0]?.litellmPolicy?.suppressReasoningVisibility === true).toBe(false);
   });
 
   it("suppresses duplicate proven non-forced Moonshot health routes", async () => {
@@ -2441,11 +3751,40 @@ describe("discoverModels via /health", () => {
 
     const result = await discoverModels("https://litellm.example.com", "sk-test", { modelsDev: false });
 
-    expect(result.models[0]?.suppressReasoningContent).toBe(true);
+    expect(result.models[0]?.litellmPolicy?.suppressReasoningVisibility).toBe(true);
   });
 });
 
 describe("discoverModels wildcard expansion via /v1/models", () => {
+  it("restores Chat reasoning carriers and cache markers after wildcard protocol selection", async () => {
+    const row = {
+      model_name: "team/*",
+      litellm_params: { model: "openai/*" },
+      model_info: {
+        supports_reasoning: true,
+        supported_openai_params: ["reasoning_effort"],
+        supports_low_reasoning_effort: true,
+      },
+    };
+    expect(modelProtocol(row.model_name, row).api).toBe("openai-responses");
+    mockEndpoints({
+      "/model/info": () => jsonResponse(200, { data: [row] }),
+      "/v1/models": () => jsonResponse(200, { data: [{ id: "team/claude-sonnet-4-5" }] }),
+    });
+
+    const { models } = await discoverModels("https://litellm.example.com", "sk-test", { modelsDev: false });
+
+    expect(models).toHaveLength(1);
+    expect(models[0]).toMatchObject({
+      id: "team/claude-sonnet-4-5",
+      api: "openai-completions",
+      litellmBackendFamily: "claude",
+      thinkingLevelMap: { low: "low" },
+      compat: { supportsReasoningEffort: true, cacheControlFormat: "anthropic" },
+    });
+    expect(models[0]).not.toHaveProperty("litellmResponsesReasoningControl");
+  });
+
   it("expands a wildcard /model/info entry and drops the literal wildcard id", async () => {
     const urls: string[] = [];
     vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
@@ -2732,7 +4071,7 @@ describe("discoverModels wildcard expansion via /v1/models", () => {
     expect(result.models).toEqual([
       expect.objectContaining({
         id: claudeId,
-        name: `${claudeId} (incomplete metadata)`,
+        name: `${getModel("anthropic", "claude-sonnet-4-6").name} (incomplete metadata)`,
         api: "openai-responses",
         reasoning: false,
         input: ["text"],
@@ -2788,6 +4127,7 @@ describe("discoverModels wildcard expansion via /v1/models", () => {
         cost: { input: 1, output: 0, cacheRead: 0, cacheWrite: 0 },
         compat: {
           supportsDeveloperRole: false,
+          supportsStrictMode: false,
         },
       }),
     ]);
@@ -2818,7 +4158,7 @@ describe("discoverModels wildcard expansion via /v1/models", () => {
     expect(result.models).toEqual([
       expect.objectContaining({
         id: "openai/gpt-4o",
-        name: "openai/gpt-4o (incomplete metadata)",
+        name: "GPT-4o (incomplete metadata)",
         reasoning: false,
         input: ["text"],
         contextWindow: 8_000,
@@ -2848,7 +4188,7 @@ describe("discoverModels wildcard expansion via /v1/models", () => {
 
     const result = await discoverModels("https://litellm.example.com", "sk-test", { modelsDev: false });
 
-    expect(result.models[0]?.suppressReasoningContent === true).toBe(suppress);
+    expect(result.models[0]?.litellmPolicy?.suppressReasoningVisibility === true).toBe(suppress);
   });
 
   it("does not suppress a forced-thinking id expanded from a Moonshot wildcard", async () => {
@@ -2869,7 +4209,7 @@ describe("discoverModels wildcard expansion via /v1/models", () => {
     const result = await discoverModels("https://litellm.example.com", "sk-test", { modelsDev: false });
 
     expect(result.models[0]?.id).toBe("kimi-k2-thinking");
-    expect(result.models[0]?.suppressReasoningContent).toBeUndefined();
+    expect(result.models[0]?.litellmPolicy?.suppressReasoningVisibility === true).toBe(false);
   });
 
   it("requires unanimous suppression evidence across matching wildcard groups", async () => {
@@ -2895,7 +4235,7 @@ describe("discoverModels wildcard expansion via /v1/models", () => {
     const result = await discoverModels("https://litellm.example.com", "sk-test", { modelsDev: false });
 
     expect(result.models[0]?.id).toBe("team/model-a");
-    expect(result.models[0]?.suppressReasoningContent).toBeUndefined();
+    expect(result.models[0]?.litellmPolicy?.suppressReasoningVisibility === true).toBe(false);
   });
 
   it("preserves a wildcard Responses route mode on expanded models", async () => {
@@ -2928,16 +4268,15 @@ describe("discoverModels wildcard expansion via /v1/models", () => {
     expect(result.models.map((model) => model.id)).not.toContain("other/model-c");
   });
 
-  it("intersects thinking levels across overlapping wildcard matches", async () => {
-    const wildcard = (modelName: string, id: string, supports: { low?: boolean; high?: boolean; max?: boolean }) => ({
+  it("uses thinking levels from the selected most-specific wildcard", async () => {
+    const wildcard = (modelName: string, id: string, supports: { low?: boolean; max?: boolean }) => ({
       model_name: modelName,
-      litellm_params: { model: `internal/${id}` },
+      litellm_params: { model: `internal/${id}`, allowed_openai_params: ["reasoning_effort"] },
       model_info: {
         id,
         mode: "chat",
         supports_reasoning: true,
         supports_low_reasoning_effort: supports.low,
-        supports_high_reasoning_effort: supports.high,
         supports_max_reasoning_effort: supports.max,
         input_cost_per_token: 0,
         output_cost_per_token: 0,
@@ -2952,17 +4291,14 @@ describe("discoverModels wildcard expansion via /v1/models", () => {
     mockEndpoints({
       "/model/info": () =>
         jsonResponse(200, {
-          data: [
-            wildcard("*", "broad", { low: true, high: true }),
-            wildcard("team/*", "narrow", { low: false, high: true, max: true }),
-          ],
+          data: [wildcard("*", "broad", { low: true }), wildcard("team/*", "narrow", { low: false, max: true })],
         }),
       "/v1/models": () => jsonResponse(200, { data: [{ id: "team/model" }] }),
     });
 
     const result = await discoverModels("https://litellm.example.com", "sk-test", { modelsDev: false });
 
-    expect(result.models[0]?.thinkingLevelMap).toEqual({ low: null, high: "high", max: null });
+    expect(result.models[0]?.thinkingLevelMap).toEqual({ low: null, xhigh: null, max: "max" });
   });
 
   it("preserves tiered pricing from a single wildcard match", async () => {
@@ -3091,7 +4427,6 @@ describe("discoverModels wildcard expansion via /v1/models", () => {
         supports_reasoning: true,
         supports_vision: true,
         supports_low_reasoning_effort: true,
-        supports_high_reasoning_effort: true,
         max_input_tokens: 80_000,
         max_output_tokens: 8_000,
         input_cost_per_token: 0.000002,
@@ -3109,7 +4444,6 @@ describe("discoverModels wildcard expansion via /v1/models", () => {
         supports_reasoning: false,
         supports_vision: false,
         supports_low_reasoning_effort: false,
-        supports_high_reasoning_effort: true,
         max_input_tokens: 40_000,
         max_output_tokens: 4_000,
         input_cost_per_token: 0.000003,
@@ -3133,7 +4467,7 @@ describe("discoverModels wildcard expansion via /v1/models", () => {
       expect(result.models).toEqual([
         {
           id: "team/claude-sonnet-4-6",
-          name: "team/claude-sonnet-4-6",
+          name: "Claude Sonnet 4.6",
           api: "openai-completions",
           litellmDiscoveryVersion: 2,
           reasoning: false,
@@ -3271,6 +4605,206 @@ describe("discoverModels wildcard expansion via /v1/models", () => {
     expect(result.source).toBe("model_info");
     expect(result.models.map((m) => m.id)).toEqual(["openai/gpt-4o"]);
     expect(urls.some((u) => u.endsWith("/v1/models"))).toBe(false);
+  });
+  it("carries a wildcard parent's tiered pricing into its child", async () => {
+    const entry = {
+      model_name: "team/*",
+      litellm_params: { model: "openai/gpt-5.4" },
+      model_info: { id: "wildcard", mode: "chat" },
+    };
+    const tiers = resolveModelInfoCatalog(entry)?.cost?.tiers;
+    expect(tiers).toBeDefined();
+    mockEndpoints({
+      "/model/info": () => jsonResponse(200, { data: [entry] }),
+      "/v1/models": () => jsonResponse(200, { data: [{ id: "team/assistant" }] }),
+    });
+
+    const result = await discoverModels("https://litellm.example.com", "sk-test", { modelsDev: false });
+
+    expect(result.models[0]?.cost.tiers).toEqual(tiers);
+  });
+
+  it("does not reintroduce a withheld model-info route through wildcard expansion", async () => {
+    mockEndpoints({
+      "/model/info": () =>
+        jsonResponse(200, {
+          data: [
+            { model_name: "team/*", model_info: { id: "wildcard", mode: "chat" } },
+            { model_name: "blocked/model", model_info: { id: "chat", mode: "chat" } },
+            { model_name: "blocked/model", model_info: { id: "embedding", mode: "embedding" } },
+          ],
+        }),
+      "/v1/models": () =>
+        jsonResponse(200, {
+          data: [
+            { id: "team/expanded", owned_by: "openai" },
+            { id: "blocked/model", owned_by: "openai" },
+          ],
+        }),
+    });
+
+    const result = await discoverModels("https://litellm.example.com", "sk-test", {});
+
+    expect(result.models.map((model) => model.id)).toEqual(["team/expanded"]);
+  });
+
+  it("keeps wildcard tool-repair withholding on the expanded model", async () => {
+    const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+    mockEndpoints({
+      "/model/info": () =>
+        jsonResponse(200, {
+          data: [
+            {
+              model_name: "team/*",
+              litellm_params: { model: "moonshot/kimi-k2.6" },
+              model_info: { id: "kimi", mode: "chat" },
+            },
+            { model_name: "team/*", model_info: { id: "unidentified", mode: "chat" } },
+          ],
+        }),
+      "/v1/models": () => jsonResponse(200, { data: [{ id: "team/assistant" }] }),
+    });
+
+    const result = await discoverModels("https://litellm.example.com", "sk-test", {});
+
+    expect(result.models[0]?.litellmPolicy).toEqual({
+      normalizeStrictToolMessages: false,
+      normalizeThinkTags: false,
+      suppressReasoningVisibility: false,
+    });
+    expect(stderr.mock.calls.flat().join(" ")).toContain("team/assistant");
+  });
+
+  it("warns when a route-only wildcard expands to a Moonshot id", async () => {
+    const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+    mockEndpoints({
+      "/model/info": () =>
+        jsonResponse(200, { data: [{ model_name: "*", model_info: { id: "wildcard", mode: "chat" } }] }),
+      "/v1/models": () => jsonResponse(200, { data: [{ id: "kimi-wildcard-review" }] }),
+    });
+
+    const result = await discoverModels("https://litellm.example.com", "sk-test", {});
+
+    expect(result.models[0]?.litellmPolicy?.normalizeStrictToolMessages).toBe(false);
+    expect(stderr.mock.calls.flat().join(" ")).toContain("kimi-wildcard-review");
+  });
+
+  it("does not warn for a wildcard candidate already published by an exact route", async () => {
+    const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+    mockEndpoints({
+      "/model/info": () =>
+        jsonResponse(200, {
+          data: [
+            { model_name: "*", model_info: { id: "wildcard", mode: "chat" } },
+            {
+              model_name: "kimi-k2.6-exact-authority",
+              litellm_params: { model: "moonshot/kimi-k2.6", allowed_openai_params: ["thinking"] },
+              model_info: { id: "exact", mode: "chat", supports_reasoning: true },
+            },
+          ],
+        }),
+      "/v1/models": () => jsonResponse(200, { data: [{ id: "kimi-k2.6-exact-authority" }] }),
+    });
+
+    const result = await discoverModels("https://litellm.example.com", "sk-test", {});
+
+    expect(result.models).toHaveLength(1);
+    expect(result.models[0]).toMatchObject({
+      id: "kimi-k2.6-exact-authority",
+      litellmPolicy: { normalizeStrictToolMessages: true },
+    });
+    expect(stderr.mock.calls.flat().join(" ")).not.toContain("kimi-k2.6-exact-authority");
+  });
+
+  it.each([
+    {
+      label: "complete",
+      pricing: {
+        input_cost_per_token: 0.000001,
+        output_cost_per_token: 0.000002,
+        cache_read_input_token_cost: 0.0000001,
+        cache_creation_input_token_cost: 0.0000002,
+      },
+      name: "GPT-5.5",
+      cost: { input: 1, output: 2, cacheRead: 0.09999999999999999, cacheWrite: 0.19999999999999998 },
+    },
+    {
+      label: "incomplete",
+      pricing: {},
+      name: "GPT-5.5 (incomplete metadata)",
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    },
+  ])("takes only catalog presentation metadata for a $label wildcard child", async ({ pricing, name, cost }) => {
+    mockEndpoints({
+      "/model/info": () =>
+        jsonResponse(200, {
+          data: [
+            {
+              model_name: "openai/*",
+              litellm_params: { model: "internal/proxy" },
+              model_info: {
+                id: "wildcard",
+                mode: "chat",
+                supports_reasoning: true,
+                supports_vision: false,
+                max_input_tokens: 200_000,
+                max_output_tokens: 100_000,
+                ...pricing,
+              },
+            },
+          ],
+        }),
+      "/v1/models": () =>
+        jsonResponse(200, {
+          data: [
+            { id: "openai/gpt-5.5", owned_by: "openai" },
+            { id: "unmatched/catalog-model", owned_by: "openai" },
+          ],
+        }),
+    });
+
+    const result = await discoverModels("https://litellm.example.com", "sk-test", {});
+
+    expect(result.models).toHaveLength(1);
+    expect(result.models[0]).toMatchObject({
+      id: "openai/gpt-5.5",
+      name,
+      input: ["text"],
+      cost,
+      contextWindow: 200_000,
+      maxTokens: 100_000,
+      reasoning: true,
+      thinkingLevelMap: NO_REASONING_LEVELS,
+    });
+    expect(result.models[0]?.compat).not.toMatchObject({ supportsReasoningEffort: true });
+  });
+
+  it("keeps parent deployment limits when a wildcard child has smaller catalog limits", async () => {
+    mockEndpoints({
+      "/model/info": () =>
+        jsonResponse(200, {
+          data: [
+            {
+              model_name: "openai/*",
+              model_info: {
+                id: "wildcard",
+                mode: "chat",
+                max_input_tokens: 200_000,
+                max_output_tokens: 100_000,
+              },
+            },
+          ],
+        }),
+      "/v1/models": () => jsonResponse(200, { data: [{ id: "openai/gpt-4o", owned_by: "openai" }] }),
+    });
+
+    const result = await discoverModels("https://litellm.example.com", "sk-test", {});
+
+    expect(result.models[0]).toMatchObject({
+      id: "openai/gpt-4o",
+      contextWindow: 200_000,
+      maxTokens: 100_000,
+    });
   });
 });
 
@@ -3474,7 +5008,7 @@ describe("discoverModels response-mode models", () => {
       name: catalog.name,
       api: "openai-responses",
       reasoning: catalog.reasoning,
-      thinkingLevelMap: catalog.thinkingLevelMap,
+      thinkingLevelMap: NO_REASONING_LEVELS,
       input: catalog.input,
       cost: catalog.cost,
       contextWindow: catalog.contextWindow,
@@ -3497,6 +5031,82 @@ describe("discoverModels response-mode models", () => {
       name: "unknown-health-route (no metadata)",
       api: "openai-completions",
     });
+  });
+  it("diagnoses a /health route that mixes chat and incompatible deployment modes", async () => {
+    const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+    mockEndpoints({
+      "/model/info?litellm_model_id=chat-id": () =>
+        jsonResponse(200, { data: [{ model_name: "health-mixed-mode", model_info: { mode: "chat" } }] }),
+      "/model/info?litellm_model_id=embed-id": () =>
+        jsonResponse(200, { data: [{ model_name: "health-mixed-mode", model_info: { mode: "embedding" } }] }),
+      "/model/info": () => jsonResponse(404, {}),
+      "/v1/models": () => jsonResponse(404, {}),
+      "/health": () =>
+        jsonResponse(200, {
+          healthy_endpoints: [
+            { model: "health-mixed-mode", model_id: "chat-id" },
+            { model: "health-mixed-mode", model_id: "embed-id" },
+          ],
+        }),
+    });
+
+    await expect(discoverModels("https://litellm.example.com", "sk-test", {})).rejects.toThrow(
+      "/v1/models returned 404",
+    );
+
+    expect(stderr).toHaveBeenCalledTimes(1);
+    expect(String(stderr.mock.calls[0]?.[0])).toContain("health-mixed-mode");
+    expect(String(stderr.mock.calls[0]?.[0])).toContain("explicitly incompatible deployment modes");
+  });
+
+  it("uses the correlated detail model_name instead of the health backend model", async () => {
+    mockEndpoints({
+      "/model/info?litellm_model_id=uuid-redirect": () =>
+        jsonResponse(200, {
+          data: [
+            {
+              model_name: "different-route",
+              litellm_params: { model: "moonshot/kimi-k3", allowed_openai_params: ["reasoning_effort"] },
+              model_info: { id: "uuid-redirect", mode: "chat", supports_reasoning: true },
+            },
+          ],
+        }),
+      "/model/info": () => jsonResponse(404, {}),
+      "/v1/models": () => jsonResponse(404, {}),
+      "/health": () =>
+        jsonResponse(200, { healthy_endpoints: [{ model: "authoritative-route", model_id: "uuid-redirect" }] }),
+    });
+
+    const result = await discoverModels("https://litellm.example.com", "sk-test", {});
+
+    expect(result.models[0]).toMatchObject({ id: "different-route", reasoning: true });
+    expect(result.models[0]?.thinkingLevelMap).toEqual({
+      off: null,
+      minimal: null,
+      low: "low",
+      medium: null,
+      high: "high",
+      xhigh: null,
+      max: null,
+    });
+  });
+
+  it.each([
+    ["openai/gpt-5.5", "openai-responses"],
+    ["unknown/health-route", "openai-completions"],
+  ])("uses catalog protocol %s for health entries without deployment detail", async (route, api) => {
+    mockEndpoints({
+      "/model/info": () => jsonResponse(404, {}),
+      "/v1/models": () => jsonResponse(404, {}),
+      "/health": () => jsonResponse(200, { healthy_endpoints: [{ model: route }] }),
+    });
+
+    const result = await discoverModels("https://litellm.example.com", "sk-test", {});
+
+    expect(result.source).toBe("health");
+    expect(result.models[0]).toMatchObject({ id: route, api });
+    if (result.models[0]?.reasoning) expect(result.models[0]?.thinkingLevelMap).toEqual(NO_REASONING_LEVELS);
+    else expect(result.models[0]).not.toHaveProperty("thinkingLevelMap");
   });
 });
 
@@ -3537,6 +5147,45 @@ describe("catalog provider candidates", () => {
 
     expect(result.models[0]?.name).toBe(`${id} (incomplete metadata)`);
     expect(result.models[0]?.cost).toEqual({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
+  });
+  it.each([
+    ["decorated mixed-case Kimi", "ToGeThEr/MoOnShOtAi/KiMi-K2.6@prod", "together_ai", 262_144],
+    ["mixed-case Claude", "AnThRoPiC/ClAuDe-SoNnEt-4-6", undefined, 1_000_000],
+    ["decorated Claude", "BeDrOcK/US.AnThRoPiC.ClAuDe-SoNnEt-4-6-V1:0", "bedrock", 1_000_000],
+  ])("retains catalog metadata for a %s provider-qualified backend", async (_case, backend, adapter, context) => {
+    mockEndpoints({
+      "/model/info": () =>
+        jsonResponse(200, {
+          data: [
+            {
+              model_name: "private/catalog-route",
+              litellm_params: { model: backend },
+              model_info: { mode: "chat", ...(adapter ? { litellm_provider: adapter } : {}) },
+            },
+          ],
+        }),
+    });
+
+    const result = await discoverModels("https://litellm.example.com", "sk-test", {});
+
+    expect(result.models[0]).toMatchObject({
+      id: "private/catalog-route",
+      name: "private/catalog-route",
+      contextWindow: context,
+      maxTokens: expect.any(Number),
+    });
+    expect(result.models[0]?.cost.input).toBeGreaterThan(0);
+  });
+
+  it("does not strip arbitrary suffixes while normalizing provider-qualified ids", () => {
+    const resolved = resolveModelInfoCatalog({
+      model_name: "private/catalog-route",
+      litellm_params: { model: "anthropic/Claude-Sonnet-4-6-preview" },
+      model_info: { mode: "chat" },
+    });
+
+    expect(resolved).toEqual({ provider: "anthropic", catalogModelId: "anthropic/Claude-Sonnet-4-6-preview" });
+    expect(resolved).not.toHaveProperty("cost");
   });
 });
 
@@ -3644,7 +5293,7 @@ describe("discoverModels fallback to /v1/models", () => {
     expect(result.models[0]).not.toHaveProperty("litellmBackendFamily");
   });
 
-  it("enriches a bare Fable 5 fallback model from the Pi catalog", async () => {
+  it("enriches a bare Fable 5 fallback model from the Pi catalog without inferring a carrier", async () => {
     vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
       const url = input instanceof URL ? input.toString() : String(input);
       if (url.endsWith("/model/info")) return new Response(null, { status: 403 });
@@ -3656,24 +5305,17 @@ describe("discoverModels fallback to /v1/models", () => {
       throw new Error(`unexpected URL: ${url}`);
     });
 
-    const result = await discoverModels("https://litellm.example.com", "sk-test", { modelsDev: false });
+    const result = await discoverModels("https://litellm.example.com", "sk-test", {});
 
     expect(result).toMatchObject({
       source: "models_list",
-      models: [
-        {
-          id: "fable-5",
-          name: "Claude Fable 5",
-          reasoning: true,
-          thinkingLevelMap: { xhigh: "xhigh", max: "max" },
-          api: "openai-completions",
-          compat: { supportsStore: false, cacheControlFormat: "anthropic" },
-        },
-      ],
+      models: [{ id: "fable-5", name: "Claude Fable 5", reasoning: true }],
     });
+    expect(result.models[0]?.thinkingLevelMap).toEqual(NO_REASONING_LEVELS);
+    expect(result.models[0]?.compat).not.toMatchObject({ supportsReasoningEffort: true });
   });
 
-  it("enriches a bare Opus 5 fallback model from the Pi catalog", async () => {
+  it("enriches a bare Opus 5 fallback model from the Pi catalog without inferring a carrier", async () => {
     vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
       const url = input instanceof URL ? input.toString() : String(input);
       if (url.endsWith("/model/info")) return new Response(null, { status: 403 });
@@ -3685,57 +5327,114 @@ describe("discoverModels fallback to /v1/models", () => {
       throw new Error(`unexpected URL: ${url}`);
     });
 
-    const result = await discoverModels("https://litellm.example.com", "sk-test", { modelsDev: false });
+    const result = await discoverModels("https://litellm.example.com", "sk-test", {});
 
     expect(result).toMatchObject({
       source: "models_list",
-      models: [
-        {
-          id: "opus-5",
-          name: "Claude Opus 5",
-          reasoning: true,
-          thinkingLevelMap: { xhigh: "xhigh", max: "max" },
-          api: "openai-completions",
-          compat: { supportsStore: false, cacheControlFormat: "anthropic" },
-        },
-      ],
+      models: [{ id: "opus-5", name: "Claude Opus 5", reasoning: true }],
     });
+    expect(result.models[0]?.thinkingLevelMap).toEqual(NO_REASONING_LEVELS);
+    expect(result.models[0]?.compat).not.toMatchObject({ supportsReasoningEffort: true });
   });
 
   it("throws when /model/info returns a non-401/403/404 error", async () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 500 }));
     await expect(discoverModels("https://litellm.example.com", "sk-test", {})).rejects.toThrow(/500/);
   });
+  it("uses Pi catalog protocol for fallback entries while denying reasoning carriers", async () => {
+    mockEndpoints({
+      "/model/info": () => jsonResponse(404, {}),
+      "/v1/models": () => jsonResponse(200, { data: [{ id: "openai/gpt-5.5", owned_by: "openai" }] }),
+    });
+
+    const result = await discoverModels("https://litellm.example.com", "sk-test", {});
+
+    expect(result.models[0]).toMatchObject({
+      api: "openai-responses",
+      reasoning: true,
+      thinkingLevelMap: NO_REASONING_LEVELS,
+    });
+    expect(result.models[0]?.compat).not.toMatchObject({ supportsReasoningEffort: true });
+  });
+
+  it("denies Pi default Chat levels when /v1/models catalog metadata has no level or carrier evidence", async () => {
+    mockEndpoints({
+      "/model/info": () => new Response(null, { status: 403 }),
+      "/v1/models": () =>
+        jsonResponse(200, {
+          data: [{ id: "claude-haiku-4-5", object: "model", owned_by: "anthropic" }],
+        }),
+    });
+
+    const result = await discoverModels("https://litellm.example.com", "sk-test", {});
+
+    expect(result).toMatchObject({
+      source: "models_list",
+      models: [
+        {
+          id: "claude-haiku-4-5",
+          reasoning: true,
+          thinkingLevelMap: NO_REASONING_LEVELS,
+        },
+      ],
+    });
+  });
 });
 
 describe("discoverModels fallback to /health", () => {
-  it("reports completed health detail requests rather than endpoint indexes", async () => {
+  it("bounds health detail concurrency while preserving endpoint order and completion progress", async () => {
     const endpoints = Array.from({ length: 11 }, (_, index) => ({
       model: `model-${index + 1}`,
       model_id: `uuid-${index + 1}`,
     }));
-    const pending: Array<(response: Response) => void> = [];
+    const pending = new Map<string, () => void>();
     const progress = vi.fn();
-    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation((input) => {
+    let active = 0;
+    let maxActive = 0;
+    vi.spyOn(globalThis, "fetch").mockImplementation((input) => {
       const url = String(input);
       if (url.endsWith("/model/info")) return Promise.resolve(new Response(null, { status: 404 }));
       if (url.endsWith("/v1/models")) return Promise.resolve(new Response(null, { status: 404 }));
       if (url.endsWith("/health")) return Promise.resolve(jsonResponse(200, { healthy_endpoints: endpoints }));
-      if (url.endsWith("uuid-11")) {
-        return Promise.resolve(jsonResponse(200, { data: [{ model_name: "model-11", model_info: { mode: "chat" } }] }));
-      }
-      return new Promise<Response>((resolve) => pending.push(resolve));
+      const deploymentId = new URL(url).searchParams.get("litellm_model_id");
+      if (!deploymentId) throw new Error(`unexpected URL: ${url}`);
+      const modelNumber = deploymentId.slice("uuid-".length);
+      active++;
+      maxActive = Math.max(maxActive, active);
+      return new Promise<Response>((resolve) => {
+        pending.set(deploymentId, () => {
+          active--;
+          resolve(jsonResponse(200, { data: [{ model_name: `model-${modelNumber}`, model_info: { mode: "chat" } }] }));
+        });
+      });
     });
+    const release = (deploymentId: string): void => {
+      const resolve = pending.get(deploymentId);
+      if (!resolve) throw new Error(`${deploymentId} is not pending`);
+      pending.delete(deploymentId);
+      resolve();
+    };
 
     const discovery = discoverModels("https://litellm.example.com", "sk-test", { onProgress: progress });
-    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(14));
-    const reportedBeforeCompletion = progress.mock.calls.some(([message]) => message === "Fetched 11/11 models...");
-    for (const [index, resolve] of pending.entries()) {
-      resolve(jsonResponse(200, { data: [{ model_name: `model-${index + 1}`, model_info: { mode: "chat" } }] }));
-    }
-    await discovery;
+    await vi.waitFor(() => expect([...pending.keys()]).toEqual(endpoints.slice(0, 8).map(({ model_id }) => model_id)));
+    expect(maxActive).toBe(8);
 
-    expect(reportedBeforeCompletion).toBe(false);
+    release("uuid-8");
+    await vi.waitFor(() => expect(pending.has("uuid-9")).toBe(true));
+    release("uuid-7");
+    await vi.waitFor(() => expect(pending.has("uuid-10")).toBe(true));
+    release("uuid-6");
+    await vi.waitFor(() => expect(pending.has("uuid-11")).toBe(true));
+    expect(progress).not.toHaveBeenCalledWith("Fetched 10/11 models...");
+    expect(maxActive).toBe(8);
+
+    for (const deploymentId of ["uuid-11", "uuid-10", "uuid-9", "uuid-5", "uuid-4", "uuid-3", "uuid-2", "uuid-1"]) {
+      release(deploymentId);
+    }
+    const result = await discovery;
+
+    expect(result.models.map((model) => model.id)).toEqual(endpoints.map(({ model }) => model));
+    expect(progress).toHaveBeenCalledWith("Fetched 10/11 models...");
     expect(progress).toHaveBeenCalledWith("Fetched 11/11 models...");
   });
 
@@ -3917,6 +5616,113 @@ describe("discoverModels fallback to /health", () => {
     expect(result.source).toBe("health");
     expect(result.models[0]?.name).toBe("vertex/claude-sonnet (incomplete metadata)");
     expect(result.models[0]).not.toHaveProperty("thinkingLevelMap");
+  });
+  it.each([
+    ["uuid-roomy", "uuid-cramped"],
+    ["uuid-cramped", "uuid-roomy"],
+  ])("groups healthy deployments by route before publication in order %j", async (...endpointIds) => {
+    mockEndpoints({
+      "/model/info?litellm_model_id=uuid-roomy": () =>
+        jsonResponse(200, {
+          data: [
+            {
+              model_name: "shared-health-route",
+              litellm_params: { model: "openai/gpt-4o" },
+              model_info: {
+                id: "roomy",
+                mode: "responses",
+                supports_reasoning: true,
+                supports_vision: true,
+                max_input_tokens: 128_000,
+                max_output_tokens: 16_384,
+                input_cost_per_token: 0.000005,
+                output_cost_per_token: 0.000015,
+                cache_read_input_token_cost: 0.0000025,
+                cache_creation_input_token_cost: 0,
+              },
+            },
+          ],
+        }),
+      "/model/info?litellm_model_id=uuid-cramped": () =>
+        jsonResponse(200, {
+          data: [
+            {
+              model_name: "shared-health-route",
+              litellm_params: { model: "internal/unknown" },
+              model_info: {
+                id: "cramped",
+                mode: "chat",
+                supports_reasoning: false,
+                supports_vision: false,
+                max_input_tokens: 64_000,
+                max_output_tokens: 8_192,
+              },
+            },
+          ],
+        }),
+      "/model/info": () => jsonResponse(404, {}),
+      "/v1/models": () => jsonResponse(404, {}),
+      "/health": () =>
+        jsonResponse(200, {
+          healthy_endpoints: endpointIds.map((model_id) => ({ model: "shared-health-route", model_id })),
+        }),
+    });
+
+    const result = await discoverModels("https://litellm.example.com", "sk-test", {});
+
+    expect(result.source).toBe("health");
+    expect(result.models).toHaveLength(1);
+    expect(result.models[0]).toMatchObject({
+      id: "shared-health-route",
+      name: "shared-health-route (incomplete metadata)",
+      api: "openai-completions",
+      reasoning: false,
+      input: ["text"],
+      contextWindow: 64_000,
+      maxTokens: 8_192,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    });
+    expect(result.models[0]).not.toHaveProperty("thinkingLevelMap");
+  });
+
+  it("groups health backends that correlate to one detail model_name", async () => {
+    mockEndpoints({
+      "/model/info?litellm_model_id=bedrock-a": () =>
+        jsonResponse(200, {
+          data: [
+            {
+              model_name: "claude-opus-5",
+              litellm_params: { model: "bedrock/us.anthropic.claude-opus-5-a" },
+              model_info: { id: "bedrock-a", mode: "chat" },
+            },
+          ],
+        }),
+      "/model/info?litellm_model_id=bedrock-b": () =>
+        jsonResponse(200, {
+          data: [
+            {
+              model_name: "claude-opus-5",
+              litellm_params: { model: "bedrock/eu.anthropic.claude-opus-5-b" },
+              model_info: { id: "bedrock-b", mode: "chat" },
+            },
+          ],
+        }),
+      "/model/info": () => jsonResponse(404, {}),
+      "/v1/models": () => jsonResponse(404, {}),
+      "/health": () =>
+        jsonResponse(200, {
+          healthy_endpoints: [
+            { model: "bedrock/us.anthropic.claude-opus-5", model_id: "bedrock-a" },
+            { model: "bedrock/eu.anthropic.claude-opus-5", model_id: "bedrock-b" },
+          ],
+        }),
+    });
+
+    const result = await discoverModels("https://litellm.example.com", "sk-test", {});
+
+    expect(result.source).toBe("health");
+    expect(result.models).toHaveLength(1);
+    expect(result.models[0]?.id).toBe("claude-opus-5");
   });
 });
 

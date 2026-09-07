@@ -897,7 +897,18 @@ describe("extension startup", () => {
           messages: [{ role: "tool", tool_call_id: "call_1", content: [{ type: "text", text: "tool output" }] }],
         },
       },
-      { model: { provider: "litellm-anthropic", id: "kimi-k2.6" } },
+      {
+        model: {
+          provider: "litellm-anthropic",
+          id: "kimi-k2.6",
+          api: "openai-completions",
+          litellmPolicy: {
+            normalizeStrictToolMessages: true,
+            normalizeThinkTags: true,
+            suppressReasoningVisibility: false,
+          },
+        },
+      },
     );
 
     expect(result).toMatchObject({
@@ -911,7 +922,11 @@ describe("extension startup", () => {
           provider: "litellm-anthropic",
           id: "k3-prod",
           api: "openai-completions",
-          suppressReasoningContent: true,
+          litellmPolicy: {
+            normalizeStrictToolMessages: true,
+            normalizeThinkTags: true,
+            suppressReasoningVisibility: true,
+          },
         },
       },
     );
@@ -929,6 +944,39 @@ describe("extension startup", () => {
       merge_reasoning_content_in_choices: true,
     });
     expect(otherRoute).toBeUndefined();
+  });
+
+  it("does not infer reasoning controls from configured provider alias route text", async () => {
+    const agentDir = await makeAgentDir();
+    await writeFile(
+      join(agentDir, "settings.json"),
+      JSON.stringify({
+        litellm: {
+          providers: {
+            "litellm-anthropic": {
+              baseUrl: "https://litellm-anthropic.example.com",
+              apiKey: "$LITELLM_ANTHROPIC_API_KEY",
+            },
+          },
+        },
+      }),
+      "utf8",
+    );
+    process.env.LITELLM_BASE_URL = "https://proxy.example.com";
+    process.env.LITELLM_API_KEY = "openai-key";
+    process.env.LITELLM_ANTHROPIC_API_KEY = "anthropic-key";
+    process.env.LITELLM_DISCOVERY_TIMEOUT_MS = "0";
+
+    const extension = await loadExtension(agentDir);
+    const pi = createPi();
+    await extension(pi);
+
+    const result = await pi.handlers.get("before_provider_request")?.[0]?.(
+      { payload: { model: "kimi-k2.6" } },
+      { model: { provider: "litellm-anthropic", id: "kimi-k2.6", api: "openai-completions" } },
+    );
+
+    expect(result).toBeUndefined();
   });
 
   it("returns a native API-key credential without discovery side effects", async () => {

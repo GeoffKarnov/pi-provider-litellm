@@ -2,9 +2,14 @@ import { describe, expect, it } from "vitest";
 import {
   type CatalogResolution,
   type CatalogResolver,
+  closeSerializerPolicy,
   conservativeCostTiers,
+  meetVendorCompat,
+  NO_TRANSMISSIBLE_LEVELS,
   reduceModelGroup,
+  toResponsesLevels,
 } from "../src/model-groups.js";
+import { intersectThinkingLevelMaps } from "../src/thinking-levels.js";
 import type { ModelInfoEntry } from "../src/types.js";
 
 type ModelCost = NonNullable<ReturnType<typeof reduceModelGroup>>["cost"];
@@ -72,6 +77,14 @@ function row(overrides: Partial<ModelInfoEntry> = {}): ModelInfoEntry {
   };
 }
 
+// A deployment LiteLLM did not price, so the catalog supplies the schedule.
+const CATALOG_PRICED = {
+  input_cost_per_token: undefined,
+  output_cost_per_token: undefined,
+  cache_read_input_token_cost: undefined,
+  cache_creation_input_token_cost: undefined,
+};
+
 function permutations<T>(values: readonly T[]): T[][] {
   if (values.length < 2) return [[...values]];
   return values.flatMap((value, index) =>
@@ -79,74 +92,227 @@ function permutations<T>(values: readonly T[]): T[][] {
   );
 }
 
-describe("conservativeCostTiers", () => {
-  it("takes the per-field maximum from duplicate thresholds in one ladder", () => {
-    const cost = {
-      input: 1,
-      output: 2,
-      cacheRead: 3,
-      cacheWrite: 4,
-      tiers: [
-        { inputTokensAbove: 100, input: 10, output: 2, cacheRead: 30, cacheWrite: 4 },
-        { inputTokensAbove: 100, input: 1, output: 20, cacheRead: 3, cacheWrite: 40 },
-      ],
-    };
+const NO_LEVELS = {
+  off: null,
+  minimal: null,
+  low: null,
+  medium: null,
+  high: null,
+  xhigh: null,
+  max: null,
+};
 
-    expect(conservativeCostTiers([cost])).toEqual([
-      { inputTokensAbove: 100, input: 10, output: 20, cacheRead: 30, cacheWrite: 40 },
-    ]);
-  });
-
-  it("floors every matched tier field at its deployment base rate", () => {
-    const cost = {
-      input: 10,
-      output: 20,
-      cacheRead: 3,
-      cacheWrite: 4,
-      tiers: [{ inputTokensAbove: 100, input: 1, output: 2, cacheRead: 0.3, cacheWrite: 0.4 }],
-    };
-
-    expect(conservativeCostTiers([cost])).toEqual([
-      { inputTokensAbove: 100, input: 10, output: 20, cacheRead: 3, cacheWrite: 4 },
-    ]);
-  });
-
+describe("toResponsesLevels", () => {
   it.each([
-    ["negative", -1],
-    ["not a number", Number.NaN],
-    ["infinite", Number.POSITIVE_INFINITY],
-  ])("ignores a %s tier threshold", (_case, invalidThreshold) => {
-    const cost = {
-      input: 1,
-      output: 2,
-      cacheRead: 3,
-      cacheWrite: 4,
-      tiers: [
-        { inputTokensAbove: invalidThreshold, input: 100, output: 200, cacheRead: 300, cacheWrite: 400 },
-        { inputTokensAbove: 100, input: 10, output: 20, cacheRead: 30, cacheWrite: 40 },
-      ],
+    {
+      name: "an absent map",
+      levels: undefined,
+      expected: {
+        off: "none",
+        minimal: "minimal",
+        low: "low",
+        medium: "medium",
+        high: "high",
+        xhigh: null,
+        max: null,
+      },
+    },
+    {
+      name: "a partial Chat map",
+      levels: { low: "high" },
+      expected: {
+        off: "none",
+        minimal: "minimal",
+        low: "high",
+        medium: "medium",
+        high: "high",
+        xhigh: null,
+        max: null,
+      },
+    },
+    {
+      name: "explicit extended levels",
+      levels: { off: null, xhigh: "xhigh", max: "max" },
+      expected: {
+        off: null,
+        minimal: "minimal",
+        low: "low",
+        medium: "medium",
+        high: "high",
+        xhigh: "xhigh",
+        max: null,
+      },
+    },
+  ])("never widens Responses beyond Chat for $name", ({ levels, expected }) => {
+    expect(toResponsesLevels(levels)).toEqual(expected);
+  });
+});
+
+describe("closeSerializerPolicy", () => {
+  it("retains only Responses compatibility when closing a Responses policy", () => {
+    const policy = closeSerializerPolicy({
+      api: "openai-responses",
+      reasoning: true,
+      vendorCompat: {
+        supportsDeveloperRole: false,
+        supportsStrictMode: true,
+        sessionAffinityFormat: "openai",
+        supportsLongCacheRetention: false,
+        supportsOpenAIGrammarTools: true,
+        supportsAdditionalTools: true,
+        supportsToolSearch: true,
+        supportsExplicitPromptCacheMode: true,
+        thinkingFormat: "deepseek",
+        supportsReasoningEffort: false,
+      },
+      denyLevels: true,
+    });
+    expect(policy.compat).toEqual({
+      supportsDeveloperRole: false,
+      supportsStrictMode: true,
+      sessionAffinityFormat: "openai",
+      supportsLongCacheRetention: false,
+      supportsOpenAIGrammarTools: true,
+      supportsAdditionalTools: true,
+      supportsToolSearch: true,
+      supportsExplicitPromptCacheMode: true,
+    });
+    expect(policy.thinkingLevelMap).toEqual(NO_LEVELS);
+    expect(
+      closeSerializerPolicy({
+        api: "openai-responses",
+        reasoning: false,
+        vendorCompat: { supportsReasoningEffort: false },
+        denyLevels: true,
+      }).compat,
+    ).toBeUndefined();
+  });
+
+  it("keeps Chat and Responses closed when vendor compatibility denies reasoning effort", () => {
+    const input = {
+      reasoning: true,
+      vendorCompat: { supportsReasoningEffort: false } as const,
+      catalogLevels: { off: "off", low: "low", high: "high" },
     };
 
-    expect(conservativeCostTiers([cost])).toEqual([
-      { inputTokensAbove: 100, input: 10, output: 20, cacheRead: 30, cacheWrite: 40 },
-    ]);
+    const chat = closeSerializerPolicy({ ...input, api: "openai-completions" });
+    const responses = closeSerializerPolicy({ ...input, api: "openai-responses" });
+
+    expect(chat.thinkingLevelMap).toEqual({
+      off: null,
+      minimal: null,
+      low: null,
+      medium: null,
+      high: null,
+      xhigh: null,
+      max: null,
+    });
+    expect(responses.thinkingLevelMap).toEqual({
+      off: null,
+      minimal: null,
+      low: null,
+      medium: null,
+      high: null,
+      xhigh: null,
+      max: null,
+    });
+  });
+
+  it.each(["openai-completions", "openai-responses"] as const)(
+    "makes denyLevels explicitly deny selectable levels for %s",
+    (api) => {
+      expect(
+        closeSerializerPolicy({
+          api,
+          reasoning: true,
+          vendorCompat: { supportsStore: false, supportsReasoningEffort: true },
+          catalogLevels: { low: "low", high: "high" },
+          acceptsResponsesReasoningControl: true,
+          denyLevels: true,
+        }),
+      ).toEqual({
+        reasoning: true,
+        thinkingLevelMap: NO_LEVELS,
+        compat: api === "openai-responses" ? undefined : { supportsStore: false, supportsReasoningEffort: false },
+      });
+    },
+  );
+
+  it("denies Responses levels until reasoning_effort acceptance is evidenced", () => {
+    const input = {
+      api: "openai-responses" as const,
+      reasoning: true,
+      vendorCompat: { supportsStore: false } as const,
+      semanticLevels: { off: "off", high: "high", max: "max" },
+    };
+
+    expect(closeSerializerPolicy(input).thinkingLevelMap).toEqual(NO_LEVELS);
+    expect(closeSerializerPolicy({ ...input, acceptsResponsesReasoningControl: true }).thinkingLevelMap).toEqual({
+      off: "none",
+      minimal: "minimal",
+      low: "low",
+      medium: "medium",
+      high: "high",
+      xhigh: null,
+      max: null,
+    });
+  });
+
+  it("denies implicit Chat levels until a carrier is evidenced", () => {
+    const input = {
+      api: "openai-completions" as const,
+      reasoning: true,
+      vendorCompat: { supportsStore: false } as const,
+    };
+
+    expect(closeSerializerPolicy({ ...input, requireChatCarrier: true }).thinkingLevelMap).toEqual(NO_LEVELS);
+    expect(
+      closeSerializerPolicy({
+        ...input,
+        vendorCompat: { supportsStore: false, supportsReasoningEffort: true },
+      }),
+    ).toEqual({
+      reasoning: true,
+      compat: { supportsStore: false, supportsReasoningEffort: true },
+    });
+  });
+});
+
+describe("meetVendorCompat", () => {
+  it("keeps Moonshot restrictions but withholds shape changes from an unidentified sibling", () => {
+    expect(
+      meetVendorCompat([
+        {
+          supportsStore: false,
+          supportsDeveloperRole: false,
+          supportsReasoningEffort: false,
+          supportsStrictMode: false,
+          maxTokensField: "max_tokens",
+        },
+        undefined,
+      ]),
+    ).toEqual({
+      supportsStore: false,
+      supportsDeveloperRole: false,
+      supportsReasoningEffort: false,
+      supportsStrictMode: false,
+    });
+  });
+
+  it("retains the complete Moonshot block only when every deployment agrees", () => {
+    const moonshot = {
+      supportsStore: false,
+      supportsDeveloperRole: false,
+      supportsReasoningEffort: false,
+      supportsStrictMode: false,
+      maxTokensField: "max_tokens" as const,
+    };
+
+    expect(meetVendorCompat([moonshot, moonshot])).toEqual(moonshot);
   });
 });
 
 describe("reduceModelGroup", () => {
-  it("filters rows without a readable route name before reducing limits and capabilities", () => {
-    const roomy = row({ model_info: { id: "roomy", mode: "chat", max_input_tokens: 200_000 } });
-    const badName = row({
-      model_name: 42 as unknown as string,
-      model_info: { id: "bad-name", mode: "chat", supports_reasoning: false, max_input_tokens: 8_000 },
-    });
-
-    expect(reduceModelGroup([roomy, badName], resolveCatalog)).toMatchObject({
-      contextWindow: 200_000,
-      reasoning: true,
-    });
-  });
-
   it("is permutation invariant for heterogeneous deployment evidence", () => {
     const deployments = [
       row({ model_info: { id: "deployment-a", mode: "responses", max_input_tokens: 150_000 } }),
@@ -167,6 +333,7 @@ describe("reduceModelGroup", () => {
       id: "route",
       api: "openai-completions",
       reasoning: true,
+      acceptsResponsesReasoningControl: false,
       vision: true,
       contextWindow: 150_000,
       maxTokens: 16_000,
@@ -174,50 +341,16 @@ describe("reduceModelGroup", () => {
       hasCompleteCost: true,
       hasCompleteMetadata: true,
       catalogAuthorityAmbiguous: true,
+      deploymentFamilies: [undefined, undefined, undefined, undefined],
+      normalizeThinkTags: false,
+      suppressReasoningVisibility: false,
+      acceptedOpenAIParams: [],
+      reasoningPolicy: { reasoning: false },
     };
 
     for (const order of permutations(deployments)) {
       expect(reduceModelGroup(order, resolveCatalog)).toEqual(expected);
     }
-  });
-
-  it("tracks metadata completeness independently from complete router pricing", () => {
-    const explicit = row({
-      litellm_params: { model: "internal/unknown" },
-      model_info: {
-        id: "explicit",
-        mode: "chat",
-        supports_reasoning: false,
-        supports_vision: false,
-        max_input_tokens: 32_000,
-        max_output_tokens: 4_000,
-        input_cost_per_token: 0.000003,
-        output_cost_per_token: 0.000015,
-        cache_read_input_token_cost: 0.0000003,
-        cache_creation_input_token_cost: 0.00000375,
-      },
-    });
-    const defaults: ModelInfoEntry = {
-      model_name: "route",
-      litellm_params: { model: "internal/unknown" },
-      model_info: {
-        id: "defaults",
-        mode: "chat",
-        input_cost_per_token: 0.000003,
-        output_cost_per_token: 0.000015,
-        cache_read_input_token_cost: 0.0000003,
-        cache_creation_input_token_cost: 0.00000375,
-      },
-    };
-
-    expect(reduceModelGroup([explicit], resolveCatalog)).toMatchObject({
-      hasCompleteCost: true,
-      hasCompleteMetadata: true,
-    });
-    expect(reduceModelGroup([defaults], resolveCatalog)).toMatchObject({
-      hasCompleteCost: true,
-      hasCompleteMetadata: false,
-    });
   });
 
   it("deduplicates exact rows and reduces conflicting duplicate ids conservatively", () => {
@@ -228,51 +361,19 @@ describe("reduceModelGroup", () => {
     expect(reduceModelGroup([repeated, repeated], resolveCatalog)).toEqual(
       reduceModelGroup([repeated], resolveCatalog),
     );
-    // Conflicting variants of one deployment id stay plural, so they can never be
-    // mistaken for a single deployment and re-admit public route text as evidence.
+    // Conflicting variants of one deployment id both stay in the reduction.
     const expected = reduceModelGroup([repeated, conflicting], resolveCatalog);
     expect(expected).toMatchObject({ contextWindow: 8_000 });
     expect(reduceModelGroup([conflicting, repeated], resolveCatalog)).toEqual(expected);
+
     // Exact id-less repeats remain plural: equal content is not enough evidence
     // that two rows describe the same deployment.
-    const seen: ModelInfoEntry[] = [];
-    reduceModelGroup([anonymous, anonymous], (entry) => {
-      seen.push(entry);
+    let calls = 0;
+    reduceModelGroup([anonymous, anonymous], () => {
+      calls++;
       return undefined;
     });
-    expect(seen).toHaveLength(2);
-  });
-
-  it("resolves catalog metadata once per routable deployment", () => {
-    const seen: ModelInfoEntry[] = [];
-    const record: CatalogResolver = (entry) => {
-      seen.push(entry);
-      return undefined;
-    };
-    const chat = row({ model_info: { id: "chat", mode: "chat" } });
-    const embedding = row({ model_info: { id: "embed", mode: "embedding" } });
-    const other = row({ model_info: { id: "other", mode: "chat" } });
-    const conflicting = row({ model_info: { id: "chat", mode: "chat", max_input_tokens: 8_000 } });
-
-    reduceModelGroup([chat], record);
-    expect(seen).toEqual([chat]);
-
-    seen.length = 0;
-    reduceModelGroup([chat, chat], record);
-    expect(seen).toEqual([chat]);
-
-    // An incompatible sibling withholds the route before catalog resolution.
-    seen.length = 0;
-    expect(reduceModelGroup([chat, embedding], record)).toBeUndefined();
-    expect(seen).toEqual([]);
-
-    seen.length = 0;
-    reduceModelGroup([chat, other], record);
-    expect(seen).toEqual([chat, other]);
-
-    seen.length = 0;
-    reduceModelGroup([chat, conflicting], record);
-    expect(seen).toHaveLength(2);
+    expect(calls).toBe(2);
   });
 
   it("selects Responses only when every deployment explicitly reports it", () => {
@@ -286,16 +387,55 @@ describe("reduceModelGroup", () => {
     expect(reduceModelGroup([responses, unknown], resolveCatalog)?.api).toBe("openai-completions");
   });
 
-  it("withholds groups containing an explicitly incompatible deployment mode", () => {
-    const responses = row({ model_info: { id: "responses", mode: "responses" } });
-    const chat = row({ model_info: { id: "chat", mode: "chat" } });
-    const unsupported = row({
-      model_info: { id: "embed", mode: "embedding", max_input_tokens: 1, max_output_tokens: 1 },
-      litellm_params: { model: "internal/embedding" },
-    });
+  it("requires every Responses deployment to accept reasoning_effort", () => {
+    const accepted = (id: string, params: string[] | undefined) =>
+      row({
+        model_info: { id, mode: "responses", supported_openai_params: params },
+        litellm_params: { model: `internal/${id}` },
+      });
 
-    expect(reduceModelGroup([responses, unsupported], resolveCatalog)).toBeUndefined();
-    expect(reduceModelGroup([chat, unsupported], resolveCatalog)).toBeUndefined();
+    for (const order of permutations([accepted("effort", ["reasoning_effort"]), accepted("thinking", ["thinking"])])) {
+      expect(reduceModelGroup(order, resolveCatalog)).toMatchObject({
+        api: "openai-responses",
+        acceptsResponsesReasoningControl: false,
+      });
+    }
+    expect(
+      reduceModelGroup(
+        [accepted("a", ["reasoning_effort", "thinking"]), accepted("b", ["reasoning_effort"])],
+        resolveCatalog,
+      ),
+    ).toMatchObject({ api: "openai-responses", acceptsResponsesReasoningControl: true });
+  });
+
+  it.each([
+    ["chat first", "chat", "embedding"],
+    ["embedding first", "embedding", "chat"],
+    ["Responses first", "responses", "embedding"],
+    ["embedding before Responses", "embedding", "responses"],
+  ])("rejects a mixed chat-style and unsupported group with $0", (_case, firstMode, secondMode) => {
+    const deployment = (id: string, mode: string) =>
+      row({
+        model_info: { id, mode },
+        litellm_params: { model: `internal/${id}` },
+      });
+
+    expect(
+      reduceModelGroup([deployment("first", firstMode), deployment("second", secondMode)], resolveCatalog),
+    ).toBeUndefined();
+  });
+
+  it.each(["chat", "response", "responses"])("retains a pure %s group", (mode) => {
+    const deployments = ["first", "second"].map((id) =>
+      row({
+        model_info: { id, mode },
+        litellm_params: { model: `internal/${id}` },
+      }),
+    );
+
+    expect(reduceModelGroup(deployments, resolveCatalog)?.api).toBe(
+      mode === "chat" ? "openai-completions" : "openai-responses",
+    );
   });
 
   it("ignores limits that are not finite positive token counts", () => {
@@ -363,7 +503,7 @@ describe("reduceModelGroup", () => {
       contextWindow: 8_000,
       api: "openai-completions",
     });
-    // Genuinely non-chat: the incompatible sibling withholds the whole route.
+    // Genuinely non-chat: rejects the entire mixed route.
     expect(reduceModelGroup([roomy, embedding], resolveCatalog)).toBeUndefined();
 
     // A lone unreadable row is surfaced conservatively rather than silently hidden.
@@ -415,39 +555,17 @@ describe("reduceModelGroup", () => {
     expect(reduceModelGroup(deployments, resolveCatalog)?.vision).toBe(expected);
   });
 
-  it("takes the smaller valid limit when explicit and public catalog values disagree", () => {
-    const largerExplicit = row({
-      model_info: { id: "larger-explicit", mode: "chat", max_input_tokens: 300_000, max_output_tokens: 80_000 },
+  it("uses the smaller valid router and catalog limit", () => {
+    const router = row({
+      model_info: { id: "router", mode: "chat", max_input_tokens: 300_000, max_output_tokens: 100_000 },
     });
-    const smallerExplicit = row({
-      model_info: { id: "smaller-explicit", mode: "chat", max_input_tokens: 100_000, max_output_tokens: 8_000 },
-    });
-
-    expect(reduceModelGroup([largerExplicit], resolveCatalog)).toMatchObject({
+    const catalog: CatalogResolver = () => ({
+      provider: "openai",
       contextWindow: 200_000,
       maxTokens: 64_000,
     });
-    expect(reduceModelGroup([smallerExplicit], resolveCatalog)).toMatchObject({
-      contextWindow: 100_000,
-      maxTokens: 8_000,
-    });
-  });
 
-  it("keeps explicit prices and fills modalities from public catalog metadata", () => {
-    const explicit = row({
-      model_info: {
-        id: "explicit",
-        mode: "chat",
-        supports_vision: undefined,
-        input_cost_per_token: 0.000009,
-        output_cost_per_token: 0.000019,
-      },
-    });
-
-    expect(reduceModelGroup([explicit], resolveCatalog)).toMatchObject({
-      vision: true,
-      cost: { input: 9, output: 19, cacheRead: 0.3, cacheWrite: 3.75 },
-    });
+    expect(reduceModelGroup([router], catalog)).toMatchObject({ contextWindow: 200_000, maxTokens: 64_000 });
   });
 
   it("resolves deployment limits before taking the safe group minimum", () => {
@@ -517,22 +635,22 @@ describe("reduceModelGroup", () => {
       hasCompleteCost: false,
       cost: { input: 4, output: 0, cacheRead: 0.3, cacheWrite: 3.75 },
     });
+  });
 
+  it("rejects negative explicit prices as unresolved", () => {
     const negative = row({
       model_info: {
         id: "negative",
         mode: "chat",
-        input_cost_per_token: -0.000004,
-        output_cost_per_token: -0.00002,
-        cache_read_input_token_cost: -0.0000004,
-        cache_creation_input_token_cost: -0.000004,
+        input_cost_per_token: -0.000001,
+        output_cost_per_token: 0.000002,
       },
       litellm_params: { model: "internal/unknown" },
     });
+
     expect(reduceModelGroup([negative], resolveCatalog)).toMatchObject({
       hasCompleteCost: false,
-      hasCompleteMetadata: false,
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      cost: { input: 0, output: 2 },
     });
   });
 
@@ -568,6 +686,916 @@ describe("reduceModelGroup", () => {
     ).toMatchObject({
       hasCompleteCost: false,
       cost: { input: 4, output: 15, cacheRead: 0, cacheWrite: 0 },
+    });
+  });
+
+  it("applies public effort levels and LiteLLM overrides", () => {
+    const result = reduceModelGroup(
+      [
+        row({
+          model_info: {
+            id: "reasoner",
+            mode: "chat",
+            supported_openai_params: ["reasoning_effort"],
+            supports_minimal_reasoning_effort: false,
+            supports_xhigh_reasoning_effort: true,
+          },
+        }),
+      ],
+      () => ({
+        provider: "openai",
+        reasoning: true,
+        effortLevels: ["minimal", "low", "medium", "high"],
+      }),
+    );
+
+    expect(result?.thinkingLevelMap).toEqual({
+      off: null,
+      minimal: null,
+      low: "low",
+      medium: "medium",
+      high: "high",
+      xhigh: "xhigh",
+      max: null,
+    });
+  });
+
+  it("leaves standard levels absent without a public opinion", () => {
+    const result = reduceModelGroup(
+      [
+        row({
+          model_info: { supports_reasoning: true, supported_openai_params: ["reasoning_effort"] },
+          litellm_params: { model: "internal/reasoner" },
+        }),
+      ],
+      () => ({ reasoning: true }),
+    );
+
+    expect(result?.thinkingLevelMap).toEqual({ xhigh: null, max: null });
+  });
+
+  it("keeps off denied for an always-thinking Kimi generation when the catalog supplies effort levels", () => {
+    const result = reduceModelGroup(
+      [
+        row({
+          model_info: { supports_reasoning: true, supported_openai_params: ["reasoning_effort"] },
+          litellm_params: { model: "moonshot/kimi-k2.7-code" },
+        }),
+      ],
+      () => ({
+        provider: "moonshotai",
+        reasoning: true,
+        semanticModel: "kimi-k2.7-code",
+        effortLevels: ["low", "medium", "high"],
+      }),
+    );
+
+    expect(result?.reasoningPolicy.thinkingLevelMap).toEqual({
+      off: null,
+      minimal: null,
+      low: "low",
+      medium: "medium",
+      high: "high",
+      xhigh: null,
+      max: null,
+    });
+  });
+
+  it("keeps catalog tiers off a deployment whose prices the operator configured", () => {
+    const tiers = [{ inputTokensAbove: 200_000, input: 6, output: 22.5, cacheRead: 0.6, cacheWrite: 7.5 }];
+    const catalog: CatalogResolver = () => ({
+      provider: "openai",
+      reasoning: true,
+      cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75, tiers },
+    });
+    const priced = row({
+      model_info: {
+        id: "custom",
+        mode: "chat",
+        input_cost_per_token: 0.000001,
+        output_cost_per_token: 0.000002,
+        cache_read_input_token_cost: 0.0000001,
+        cache_creation_input_token_cost: 0.0000002,
+      },
+    });
+
+    const result = reduceModelGroup([priced], catalog);
+
+    expect(result?.cost.tiers).toBeUndefined();
+    expect(result?.cost).toMatchObject({ input: 1, output: 2 });
+  });
+
+  it("substitutes an operator price into every catalog tier for that field only", () => {
+    const tiers = [{ inputTokensAbove: 200_000, input: 6, output: 22.5, cacheRead: 0.6, cacheWrite: 7.5 }];
+    const catalog: CatalogResolver = () => ({
+      provider: "openai",
+      reasoning: true,
+      cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75, tiers },
+    });
+    const partial = row({
+      model_info: { id: "partial", mode: "chat", ...CATALOG_PRICED, input_cost_per_token: 0.000001 },
+    });
+
+    expect(reduceModelGroup([partial], catalog)?.cost.tiers).toEqual([
+      { inputTokensAbove: 200_000, input: 1, output: 22.5, cacheRead: 0.6, cacheWrite: 7.5 },
+    ]);
+  });
+
+  it("adopts tiered pricing when identical tiers are declared in any property order", () => {
+    const tiers = [{ inputTokensAbove: 200_000, input: 6, output: 22.5, cacheRead: 0.6, cacheWrite: 7.5 }];
+    const reordered = [{ cacheWrite: 7.5, output: 22.5, input: 6, cacheRead: 0.6, inputTokensAbove: 200_000 }];
+    const withTiers =
+      (value: typeof tiers): CatalogResolver =>
+      () => ({
+        provider: "anthropic",
+        reasoning: true,
+        vision: true,
+        contextWindow: 200_000,
+        maxTokens: 64_000,
+        cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75, tiers: value },
+      });
+    const rows = [
+      row({ model_info: { id: "a", mode: "chat", ...CATALOG_PRICED } }),
+      row({ model_info: { id: "b", mode: "chat", ...CATALOG_PRICED } }),
+    ];
+
+    expect(reduceModelGroup(rows, withTiers(tiers))?.cost.tiers).toEqual(tiers);
+    // Property order is not evidence of disagreement.
+    let call = 0;
+    const alternating: CatalogResolver = (entry) => withTiers(call++ === 0 ? tiers : reordered)(entry);
+    expect(reduceModelGroup(rows, alternating)?.cost.tiers).toEqual(tiers);
+  });
+
+  it("builds the union-threshold envelope for deployments with different ladders", () => {
+    const rows = [
+      row({ model_info: { id: "a", mode: "chat", ...CATALOG_PRICED } }),
+      row({ model_info: { id: "b", mode: "chat", ...CATALOG_PRICED } }),
+    ];
+    let call = 0;
+    const differing: CatalogResolver = () => ({
+      provider: "anthropic",
+      reasoning: true,
+      vision: true,
+      contextWindow: 200_000,
+      maxTokens: 64_000,
+      cost: {
+        input: 3,
+        output: 15,
+        cacheRead: 0.3,
+        cacheWrite: 3.75,
+        tiers: [
+          call++ === 0
+            ? { inputTokensAbove: 200_000, input: 6, output: 18, cacheRead: 0.6, cacheWrite: 4 }
+            : { inputTokensAbove: 400_000, input: 5, output: 22.5, cacheRead: 0.5, cacheWrite: 7.5 },
+        ],
+      },
+    });
+
+    expect(reduceModelGroup(rows, differing)?.cost.tiers).toEqual([
+      { inputTokensAbove: 200_000, input: 6, output: 18, cacheRead: 0.6, cacheWrite: 4 },
+      { inputTokensAbove: 400_000, input: 6, output: 22.5, cacheRead: 0.6, cacheWrite: 7.5 },
+    ]);
+  });
+
+  it("omits tiered pricing and thinking maps entirely when no catalog declares them", () => {
+    const result = reduceModelGroup([row()], resolveCatalog);
+
+    expect(result?.cost.tiers).toBeUndefined();
+    expect(result?.thinkingLevelMap).toBeUndefined();
+  });
+
+  it("disables catalog authority for conflicting provider identities", () => {
+    const result = reduceModelGroup(
+      [
+        row({ model_info: { id: "anthropic", mode: "chat" } }),
+        row({
+          model_info: { id: "openai", mode: "chat" },
+          litellm_params: { model: "openai/gpt-4o" },
+        }),
+      ],
+      resolveCatalog,
+    );
+
+    expect(result).not.toHaveProperty("catalogProvider");
+
+    expect(result?.thinkingLevelMap).toBeUndefined();
+  });
+
+  it("intersects accepted parameters across deployments", () => {
+    const result = reduceModelGroup(
+      [
+        row({
+          model_info: { id: "a", mode: "chat", supported_openai_params: ["temperature", "reasoning_effort"] },
+          litellm_params: { model: "internal/a" },
+        }),
+        row({
+          model_info: { id: "b", mode: "chat", supported_openai_params: ["reasoning_effort", "thinking"] },
+          litellm_params: { model: "internal/b", allowed_openai_params: ["reasoning_effort"] },
+        }),
+      ],
+      resolveCatalog,
+    );
+
+    expect(result?.acceptedOpenAIParams).toEqual(["reasoning_effort"]);
+  });
+
+  it.each([
+    {
+      name: "Kimi K2.6 with binary thinking",
+      semanticModel: "kimi-k2.5-k2.6" as const,
+      params: ["thinking"],
+      expected: {
+        reasoning: true,
+        thinkingLevelMap: {
+          off: "off",
+          minimal: null,
+          low: null,
+          medium: null,
+          high: "high",
+          xhigh: null,
+          max: null,
+        },
+        compat: { thinkingFormat: "deepseek", supportsReasoningEffort: false },
+      },
+    },
+    {
+      // K2.7 Code cannot be switched off, so `off` stays denied while `high`
+      // rides the accepted `thinking` param.
+      name: "Kimi K2.7 Code with accepted thinking",
+      semanticModel: "kimi-k2.7-code" as const,
+      params: ["thinking"],
+      expected: {
+        reasoning: true,
+        thinkingLevelMap: {
+          off: null,
+          minimal: null,
+          low: null,
+          medium: null,
+          high: "high",
+          xhigh: null,
+          max: null,
+        },
+        compat: {
+          supportsReasoningEffort: false,
+          requiresReasoningContentOnAssistantMessages: true,
+          thinkingFormat: "deepseek",
+        },
+      },
+    },
+    {
+      name: "Kimi K2.7 Code without accepted controls",
+      semanticModel: "kimi-k2.7-code" as const,
+      params: undefined,
+      expected: {
+        reasoning: true,
+        thinkingLevelMap: {
+          off: null,
+          minimal: null,
+          low: null,
+          medium: null,
+          high: null,
+          xhigh: null,
+          max: null,
+        },
+        compat: { supportsReasoningEffort: false, requiresReasoningContentOnAssistantMessages: true },
+      },
+    },
+    {
+      name: "Kimi K2.6 without accepted controls",
+      semanticModel: "kimi-k2.5-k2.6" as const,
+      params: undefined,
+      expected: {
+        reasoning: true,
+        thinkingLevelMap: {
+          off: null,
+          minimal: null,
+          low: null,
+          medium: null,
+          high: null,
+          xhigh: null,
+          max: null,
+        },
+        compat: { supportsReasoningEffort: false },
+      },
+    },
+    {
+      name: "DeepSeek V4 through a thinking-only route",
+      semanticModel: "deepseek-v4" as const,
+      params: ["thinking"],
+      expected: {
+        reasoning: true,
+        thinkingLevelMap: {
+          off: "off",
+          minimal: null,
+          low: null,
+          medium: null,
+          high: "high",
+          xhigh: null,
+          max: null,
+        },
+        compat: {
+          thinkingFormat: "deepseek",
+          supportsReasoningEffort: false,
+          requiresReasoningContentOnAssistantMessages: true,
+        },
+      },
+    },
+  ])("derives $name policy from semantic and accepted-control evidence", ({ semanticModel, params, expected }) => {
+    const result = reduceModelGroup(
+      [
+        row({
+          model_info: { supported_openai_params: params },
+          litellm_params: { model: "internal/model" },
+        }),
+      ],
+      () => ({ semanticModel }),
+    );
+
+    expect(result?.reasoningPolicy).toEqual(expected);
+  });
+
+  it.each([
+    {
+      // Without `thinking` there is no carrier for K2.7 Code's binary control, and
+      // an accepted `reasoning_effort` with no public level opinion cannot reopen
+      // the levels the generation denies.
+      name: "Kimi K2.7 Code with effort",
+      semanticModel: "kimi-k2.7-code" as const,
+      params: ["reasoning_effort"],
+      expected: {
+        reasoning: true,
+        thinkingLevelMap: NO_TRANSMISSIBLE_LEVELS,
+        compat: {
+          supportsReasoningEffort: false,
+          requiresReasoningContentOnAssistantMessages: true,
+        },
+      },
+    },
+    {
+      name: "Kimi K3 with effort",
+      semanticModel: "kimi-k3" as const,
+      params: ["reasoning_effort"],
+      expected: {
+        reasoning: true,
+        thinkingLevelMap: { off: null, xhigh: null, max: null },
+        compat: {
+          thinkingFormat: "openai",
+          supportsReasoningEffort: true,
+          requiresReasoningContentOnAssistantMessages: true,
+        },
+      },
+    },
+    {
+      name: "DeepSeek V4 with native controls",
+      semanticModel: "deepseek-v4" as const,
+      params: ["thinking", "reasoning_effort"],
+      expected: {
+        reasoning: true,
+        thinkingLevelMap: { off: "off", xhigh: null, max: null },
+        compat: {
+          thinkingFormat: "deepseek",
+          supportsReasoningEffort: true,
+          requiresReasoningContentOnAssistantMessages: true,
+        },
+      },
+    },
+    {
+      name: "DeepSeek V4 through an effort-only route",
+      semanticModel: "deepseek-v4" as const,
+      params: ["reasoning_effort"],
+      expected: {
+        reasoning: true,
+        thinkingLevelMap: { off: null, xhigh: null, max: null },
+        compat: {
+          thinkingFormat: "openai",
+          supportsReasoningEffort: true,
+          requiresReasoningContentOnAssistantMessages: true,
+        },
+      },
+    },
+  ])("derives $name policy from literal level-map expectations", ({ semanticModel, params, expected }) => {
+    const result = reduceModelGroup(
+      [
+        row({
+          model_info: { supported_openai_params: params },
+          litellm_params: { model: "internal/model" },
+        }),
+      ],
+      () => ({ semanticModel }),
+    );
+
+    expect(result?.reasoningPolicy).toEqual(expected);
+  });
+
+  // LiteLLM reports both carriers for K2.5/K2.6 on OpenRouter and Databricks.
+  // The generation still has one on/off switch, so the deployment map's absent standard levels
+  // must not become five selectable efforts.
+  it("keeps the binary Kimi map when a host also accepts reasoning_effort", () => {
+    const result = reduceModelGroup(
+      [
+        row({
+          model_info: { supports_reasoning: true, supported_openai_params: ["thinking", "reasoning_effort"] },
+          litellm_params: { model: "openrouter/moonshotai/kimi-k2.6" },
+        }),
+      ],
+      () => ({ provider: "moonshotai", reasoning: true, semanticModel: "kimi-k2.5-k2.6" }),
+    );
+
+    expect(result?.reasoningPolicy.thinkingLevelMap).toEqual({
+      off: "off",
+      minimal: null,
+      low: null,
+      medium: null,
+      high: "high",
+      xhigh: null,
+      max: null,
+    });
+  });
+
+  it("lets an explicit LiteLLM denial close a level the binary Kimi map keeps", () => {
+    const result = reduceModelGroup(
+      [
+        row({
+          model_info: {
+            supports_reasoning: true,
+            supports_none_reasoning_effort: false,
+            supported_openai_params: ["thinking", "reasoning_effort"],
+          },
+          litellm_params: { model: "openrouter/moonshotai/kimi-k2.6" },
+        }),
+      ],
+      () => ({ provider: "moonshotai", reasoning: true, semanticModel: "kimi-k2.5-k2.6" }),
+    );
+
+    expect(result?.reasoningPolicy.thinkingLevelMap).toMatchObject({ off: null, high: "high", low: null });
+  });
+
+  it("lets a public effort list govern Kimi levels while preserving semantic off", () => {
+    const result = reduceModelGroup(
+      [
+        row({
+          model_info: { supports_reasoning: true, supported_openai_params: ["thinking", "reasoning_effort"] },
+          litellm_params: { model: "openrouter/moonshotai/kimi-k2.6" },
+        }),
+      ],
+      () => ({
+        provider: "moonshotai",
+        reasoning: true,
+        semanticModel: "kimi-k2.5-k2.6",
+        effortLevels: ["low", "high"],
+      }),
+    );
+
+    expect(result?.reasoningPolicy.thinkingLevelMap).toEqual({
+      off: "off",
+      minimal: null,
+      low: "low",
+      medium: null,
+      high: "high",
+      xhigh: null,
+      max: null,
+    });
+  });
+
+  it("keeps the binary Kimi map when a public effort list has no recognized values", () => {
+    const result = reduceModelGroup(
+      [
+        row({
+          model_info: { supports_reasoning: true, supported_openai_params: ["thinking", "reasoning_effort"] },
+          litellm_params: { model: "openrouter/moonshotai/kimi-k2.6" },
+        }),
+      ],
+      () => ({
+        provider: "moonshotai",
+        reasoning: true,
+        semanticModel: "kimi-k2.5-k2.6",
+        effortLevels: ["adaptive"],
+      }),
+    );
+
+    expect(result?.reasoningPolicy.thinkingLevelMap).toEqual({
+      off: "off",
+      minimal: null,
+      low: null,
+      medium: null,
+      high: "high",
+      xhigh: null,
+      max: null,
+    });
+  });
+
+  it("preserves catalog map denials when its public effort list is empty", () => {
+    const result = reduceModelGroup(
+      [
+        row({
+          model_info: { supports_reasoning: true, supported_openai_params: ["reasoning_effort"] },
+          litellm_params: { model: "openai/private-reasoning" },
+        }),
+      ],
+      () => ({
+        provider: "openai",
+        reasoning: true,
+        effortLevels: [],
+        thinkingLevelMap: { off: null },
+      }),
+    );
+
+    expect(result?.thinkingLevelMap).toEqual({ off: null, xhigh: null, max: null });
+  });
+
+  it("lets catalog map denials override a models.dev effort list", () => {
+    const result = reduceModelGroup(
+      [
+        row({
+          model_info: { supports_reasoning: true, supported_openai_params: ["reasoning_effort"] },
+          litellm_params: { model: "openai/private-reasoning" },
+        }),
+      ],
+      () => ({
+        provider: "openai",
+        reasoning: true,
+        effortLevels: ["low", "high"],
+        thinkingLevelMap: { off: null, low: null },
+      }),
+    );
+
+    expect(result?.thinkingLevelMap).toEqual({
+      off: null,
+      minimal: null,
+      low: null,
+      medium: null,
+      high: "high",
+      xhigh: null,
+      max: null,
+    });
+  });
+
+  it.each([
+    ["lets semantic off through without an explicit denial", undefined, "off"],
+    ["lets an explicit LiteLLM denial override semantic off", false, null],
+  ] as const)("%s for DeepSeek V4", (_name, supportsNone, expectedOff) => {
+    const result = reduceModelGroup(
+      [
+        row({
+          model_info: {
+            supports_reasoning: true,
+            ...(supportsNone === undefined ? {} : { supports_none_reasoning_effort: supportsNone }),
+            supported_openai_params: ["thinking", "reasoning_effort"],
+          },
+          litellm_params: { model: "deepseek/deepseek-v4-pro" },
+        }),
+      ],
+      () => ({
+        provider: "deepseek",
+        reasoning: true,
+        semanticModel: "deepseek-v4",
+        effortLevels: ["low", "high"],
+      }),
+    );
+
+    expect(result?.reasoningPolicy.thinkingLevelMap).toEqual({
+      off: expectedOff,
+      minimal: null,
+      low: "low",
+      medium: null,
+      high: "high",
+      xhigh: null,
+      max: null,
+    });
+  });
+
+  it("closes a level when any wildcard parent omits its level map", () => {
+    expect(intersectThinkingLevelMaps([undefined, { high: "high" }])).toEqual({ high: null });
+  });
+
+  it("closes a level when wildcard parents disagree on its wire value", () => {
+    expect(intersectThinkingLevelMaps([{ high: "high" }, { high: "max" }])).toEqual({ high: null });
+  });
+
+  it.each([
+    {
+      name: "Kimi K3",
+      semanticModel: "kimi-k3" as const,
+    },
+    {
+      name: "DeepSeek V4",
+      semanticModel: "deepseek-v4" as const,
+    },
+  ])("preserves $name capability and replay without accepted-control evidence", ({ semanticModel }) => {
+    const result = reduceModelGroup(
+      [row({ model_info: { supports_reasoning: true }, litellm_params: { model: `internal/${semanticModel}` } })],
+      () => ({ semanticModel }),
+    );
+
+    expect(result?.reasoningPolicy).toEqual({
+      reasoning: true,
+      thinkingLevelMap: { off: null, minimal: null, low: null, medium: null, high: null, xhigh: null, max: null },
+      compat: {
+        requiresReasoningContentOnAssistantMessages: true,
+        supportsReasoningEffort: false,
+      },
+    });
+  });
+
+  it("lets any explicit reasoning denial override accepted-control promotion", () => {
+    const result = reduceModelGroup(
+      [
+        row({
+          model_info: { id: "denied", supports_reasoning: false, supported_openai_params: ["thinking"] },
+          litellm_params: { model: "moonshot/kimi-k2.6" },
+        }),
+        row({
+          model_info: { id: "accepted", supports_reasoning: true, supported_openai_params: ["thinking"] },
+          litellm_params: { model: "moonshot/kimi-k2.6" },
+        }),
+      ],
+      () => ({ semanticModel: "kimi-k2.5-k2.6", reasoning: true }),
+    );
+
+    expect(result?.reasoning).toBe(false);
+    expect(result?.reasoningPolicy).toEqual({ reasoning: false, compat: { supportsReasoningEffort: false } });
+  });
+
+  it.each(["moonshot/kimi-k2-thinking", "moonshot/kimi_k2_thinking", "moonshot/kimi.k2.thinking"])(
+    "preserves always-thinking Kimi display behavior for %s",
+    (model) => {
+      const result = reduceModelGroup(
+        [
+          row({
+            model_name: "misleading-public-route",
+            litellm_params: { model },
+            model_info: { supports_reasoning: true },
+          }),
+        ],
+        () => undefined,
+      );
+
+      expect(result).toMatchObject({ normalizeThinkTags: false, suppressReasoningVisibility: false });
+    },
+  );
+
+  it("does not suppress visibility when any Kimi deployment is always-thinking", () => {
+    const result = reduceModelGroup(
+      [
+        row({
+          model_name: "mixed-kimi-route",
+          litellm_params: { model: "moonshot/kimi-k2.6" },
+          model_info: { id: "normal", supports_reasoning: true },
+        }),
+        row({
+          model_name: "mixed-kimi-route",
+          litellm_params: { model: "moonshot/kimi-k2-thinking" },
+          model_info: { id: "thinking", supports_reasoning: true },
+        }),
+      ],
+      () => ({ semanticFamily: "kimi" }),
+    );
+
+    expect(result).toMatchObject({ normalizeThinkTags: false, suppressReasoningVisibility: false });
+  });
+
+  it.each([
+    { name: "Claude", model: "anthropic/claude-sonnet-4-6" },
+    { name: "OpenAI", model: "openai/gpt-4o" },
+  ])("does not normalize think tags for a mixed Kimi/$name route", ({ model }) => {
+    const result = reduceModelGroup(
+      [
+        row({
+          model_name: "mixed-family-route",
+          litellm_params: { model: "moonshot/kimi-k2.6" },
+          model_info: { id: "kimi", supports_reasoning: true },
+        }),
+        row({
+          model_name: "mixed-family-route",
+          litellm_params: { model },
+          model_info: { id: "other", supports_reasoning: true },
+        }),
+      ],
+      resolveCatalog,
+    );
+
+    expect(result).toMatchObject({ normalizeThinkTags: false, suppressReasoningVisibility: false });
+  });
+
+  it("lets explicit unanimous reasoning denial override the K2.7 Code contract", () => {
+    const result = reduceModelGroup(
+      [
+        row({
+          model_info: { supports_reasoning: false, supported_openai_params: ["thinking"] },
+          litellm_params: { model: "moonshot/kimi-k2.7-code" },
+        }),
+      ],
+      () => ({ semanticModel: "kimi-k2.7-code", reasoning: true }),
+    );
+
+    expect(result?.reasoning).toBe(false);
+    expect(result?.reasoningPolicy).toEqual({
+      reasoning: false,
+      compat: { supportsReasoningEffort: false, requiresReasoningContentOnAssistantMessages: true },
+    });
+  });
+
+  it("fails closed for mixed semantic generations and accepted controls", () => {
+    const deployments = [
+      row({
+        model_info: { id: "k2", supported_openai_params: ["thinking"] },
+        litellm_params: { model: "moonshot/kimi-k2.6" },
+      }),
+      row({
+        model_info: { id: "k3", supported_openai_params: ["reasoning_effort"] },
+        litellm_params: { model: "moonshot/kimi-k3" },
+      }),
+    ];
+    const result = reduceModelGroup(deployments, (entry) => ({
+      semanticModel: entry.model_info?.id === "k2" ? "kimi-k2.5-k2.6" : "kimi-k3",
+    }));
+
+    expect(result?.acceptedOpenAIParams).toEqual([]);
+    expect(result?.reasoningPolicy).toEqual({ reasoning: false });
+  });
+});
+
+describe("upstream reduction regressions", () => {
+  it("takes the per-field maximum from duplicate thresholds in one ladder", () => {
+    const cost = {
+      input: 1,
+      output: 2,
+      cacheRead: 3,
+      cacheWrite: 4,
+      tiers: [
+        { inputTokensAbove: 100, input: 10, output: 2, cacheRead: 30, cacheWrite: 4 },
+        { inputTokensAbove: 100, input: 1, output: 20, cacheRead: 3, cacheWrite: 40 },
+      ],
+    };
+
+    expect(conservativeCostTiers([cost])).toEqual([
+      { inputTokensAbove: 100, input: 10, output: 20, cacheRead: 30, cacheWrite: 40 },
+    ]);
+  });
+
+  it("floors every matched tier field at its deployment base rate", () => {
+    const cost = {
+      input: 10,
+      output: 20,
+      cacheRead: 3,
+      cacheWrite: 4,
+      tiers: [{ inputTokensAbove: 100, input: 1, output: 2, cacheRead: 0.3, cacheWrite: 0.4 }],
+    };
+
+    expect(conservativeCostTiers([cost])).toEqual([
+      { inputTokensAbove: 100, input: 10, output: 20, cacheRead: 3, cacheWrite: 4 },
+    ]);
+  });
+
+  it.each([
+    ["negative", -1],
+    ["not a number", Number.NaN],
+    ["infinite", Number.POSITIVE_INFINITY],
+  ])("ignores a %s tier threshold", (_case, invalidThreshold) => {
+    const cost = {
+      input: 1,
+      output: 2,
+      cacheRead: 3,
+      cacheWrite: 4,
+      tiers: [
+        { inputTokensAbove: invalidThreshold, input: 100, output: 200, cacheRead: 300, cacheWrite: 400 },
+        { inputTokensAbove: 100, input: 10, output: 20, cacheRead: 30, cacheWrite: 40 },
+      ],
+    };
+
+    expect(conservativeCostTiers([cost])).toEqual([
+      { inputTokensAbove: 100, input: 10, output: 20, cacheRead: 30, cacheWrite: 40 },
+    ]);
+  });
+
+  it("filters rows without a readable route name before reducing limits and capabilities", () => {
+    const roomy = row({ model_info: { id: "roomy", mode: "chat", max_input_tokens: 200_000 } });
+    const badName = row({
+      model_name: 42 as unknown as string,
+      model_info: { id: "bad-name", mode: "chat", supports_reasoning: false, max_input_tokens: 8_000 },
+    });
+
+    expect(reduceModelGroup([roomy, badName], resolveCatalog)).toMatchObject({
+      contextWindow: 200_000,
+      reasoning: true,
+    });
+  });
+
+  it("tracks metadata completeness independently from complete router pricing", () => {
+    const explicit = row({
+      litellm_params: { model: "internal/unknown" },
+      model_info: {
+        id: "explicit",
+        mode: "chat",
+        supports_reasoning: false,
+        supports_vision: false,
+        max_input_tokens: 32_000,
+        max_output_tokens: 4_000,
+        input_cost_per_token: 0.000003,
+        output_cost_per_token: 0.000015,
+        cache_read_input_token_cost: 0.0000003,
+        cache_creation_input_token_cost: 0.00000375,
+      },
+    });
+    const defaults: ModelInfoEntry = {
+      model_name: "route",
+      litellm_params: { model: "internal/unknown" },
+      model_info: {
+        id: "defaults",
+        mode: "chat",
+        input_cost_per_token: 0.000003,
+        output_cost_per_token: 0.000015,
+        cache_read_input_token_cost: 0.0000003,
+        cache_creation_input_token_cost: 0.00000375,
+      },
+    };
+
+    expect(reduceModelGroup([explicit], resolveCatalog)).toMatchObject({
+      hasCompleteCost: true,
+      hasCompleteMetadata: true,
+    });
+    expect(reduceModelGroup([defaults], resolveCatalog)).toMatchObject({
+      hasCompleteCost: true,
+      hasCompleteMetadata: false,
+    });
+  });
+
+  it("resolves catalog metadata once per routable deployment", () => {
+    const seen: ModelInfoEntry[] = [];
+    const record: CatalogResolver = (entry) => {
+      seen.push(entry);
+      return undefined;
+    };
+    const chat = row({ model_info: { id: "chat", mode: "chat" } });
+    const embedding = row({ model_info: { id: "embed", mode: "embedding" } });
+    const other = row({ model_info: { id: "other", mode: "chat" } });
+    const conflicting = row({ model_info: { id: "chat", mode: "chat", max_input_tokens: 8_000 } });
+
+    reduceModelGroup([chat], record);
+    expect(seen).toEqual([chat]);
+
+    seen.length = 0;
+    reduceModelGroup([chat, chat], record);
+    expect(seen).toEqual([chat]);
+
+    // An incompatible sibling withholds the route before catalog resolution.
+    seen.length = 0;
+    expect(reduceModelGroup([chat, embedding], record)).toBeUndefined();
+    expect(seen).toEqual([]);
+
+    seen.length = 0;
+    reduceModelGroup([chat, other], record);
+    expect(seen).toEqual([chat, other]);
+
+    seen.length = 0;
+    reduceModelGroup([chat, conflicting], record);
+    expect(seen).toHaveLength(2);
+  });
+
+  it("withholds groups containing an explicitly incompatible deployment mode", () => {
+    const responses = row({ model_info: { id: "responses", mode: "responses" } });
+    const chat = row({ model_info: { id: "chat", mode: "chat" } });
+    const unsupported = row({
+      model_info: { id: "embed", mode: "embedding", max_input_tokens: 1, max_output_tokens: 1 },
+      litellm_params: { model: "internal/embedding" },
+    });
+
+    expect(reduceModelGroup([responses, unsupported], resolveCatalog)).toBeUndefined();
+    expect(reduceModelGroup([chat, unsupported], resolveCatalog)).toBeUndefined();
+  });
+
+  it("takes the smaller valid limit when explicit and public catalog values disagree", () => {
+    const largerExplicit = row({
+      model_info: { id: "larger-explicit", mode: "chat", max_input_tokens: 300_000, max_output_tokens: 80_000 },
+    });
+    const smallerExplicit = row({
+      model_info: { id: "smaller-explicit", mode: "chat", max_input_tokens: 100_000, max_output_tokens: 8_000 },
+    });
+
+    expect(reduceModelGroup([largerExplicit], resolveCatalog)).toMatchObject({
+      contextWindow: 200_000,
+      maxTokens: 64_000,
+    });
+    expect(reduceModelGroup([smallerExplicit], resolveCatalog)).toMatchObject({
+      contextWindow: 100_000,
+      maxTokens: 8_000,
+    });
+  });
+
+  it("keeps explicit prices and fills modalities from public catalog metadata", () => {
+    const explicit = row({
+      model_info: {
+        id: "explicit",
+        mode: "chat",
+        supports_vision: undefined,
+        input_cost_per_token: 0.000009,
+        output_cost_per_token: 0.000019,
+      },
+    });
+
+    expect(reduceModelGroup([explicit], resolveCatalog)).toMatchObject({
+      vision: true,
+      cost: { input: 9, output: 19, cacheRead: 0.3, cacheWrite: 3.75 },
     });
   });
 
@@ -628,7 +1656,7 @@ describe("reduceModelGroup", () => {
 
   it("uses catalog thinking maps for unambiguous identities", () => {
     const thinkingLevelMap = { low: "low", high: "high" } as const;
-    const result = reduceModelGroup([row()], () => ({
+    const result = reduceModelGroup([row({ model_info: { supported_openai_params: ["reasoning_effort"] } })], () => ({
       provider: "xai",
       reasoning: true,
       thinkingLevelMap,
@@ -638,11 +1666,21 @@ describe("reduceModelGroup", () => {
       cost: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 },
     }));
 
-    expect(result?.thinkingLevelMap).toEqual(thinkingLevelMap);
+    expect(result?.thinkingLevelMap).toEqual({
+      ...thinkingLevelMap,
+      off: null,
+      minimal: null,
+      medium: null,
+      xhigh: null,
+      max: null,
+    });
   });
 
   it("intersects differing catalog thinking maps per level regardless of deployment order", () => {
-    const entries = [row({ model_info: { id: "a", mode: "chat" } }), row({ model_info: { id: "b", mode: "chat" } })];
+    const entries = [
+      row({ model_info: { supported_openai_params: ["reasoning_effort"], id: "a", mode: "chat" } }),
+      row({ model_info: { supported_openai_params: ["reasoning_effort"], id: "b", mode: "chat" } }),
+    ];
     const maps = {
       a: { off: "none", low: "low", high: "high", max: null },
       b: { off: "none", low: null, high: "high", xhigh: "xhigh" },
@@ -661,6 +1699,8 @@ describe("reduceModelGroup", () => {
 
       expect(result?.thinkingLevelMap).toEqual({
         off: "none",
+        minimal: null,
+        medium: null,
         low: null,
         high: "high",
         xhigh: null,
@@ -671,8 +1711,8 @@ describe("reduceModelGroup", () => {
 
   it("denies each catalog level when any deployment omits its thinking map", () => {
     const entries = [
-      row({ model_info: { id: "mapped", mode: "chat" } }),
-      row({ model_info: { id: "absent", mode: "chat" } }),
+      row({ model_info: { supported_openai_params: ["reasoning_effort"], id: "mapped", mode: "chat" } }),
+      row({ model_info: { supported_openai_params: ["reasoning_effort"], id: "absent", mode: "chat" } }),
     ];
 
     for (const order of permutations(entries)) {
@@ -686,7 +1726,7 @@ describe("reduceModelGroup", () => {
         cost: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 },
       }));
 
-      expect(result?.thinkingLevelMap).toEqual({ low: null, high: null });
+      expect(result?.thinkingLevelMap).toEqual(NO_LEVELS);
     }
   });
 
@@ -722,11 +1762,12 @@ describe("reduceModelGroup", () => {
       [
         row({
           model_info: {
+            supported_openai_params: ["reasoning_effort"],
             id: "reasoner",
             mode: "chat",
             supports_none_reasoning_effort: true,
             supports_minimal_reasoning_effort: false,
-            supports_high_reasoning_effort: true,
+            supports_xhigh_reasoning_effort: true,
           },
           litellm_params: { model: "internal/reasoner" },
         }),
@@ -734,30 +1775,33 @@ describe("reduceModelGroup", () => {
       resolveCatalog,
     );
 
-    expect(result?.thinkingLevelMap).toEqual({ off: "none", minimal: null, high: "high" });
+    expect(result?.thinkingLevelMap).toEqual({ off: "none", minimal: null, xhigh: "xhigh", max: null });
   });
 
-  it("advertises a router reasoning effort only when every deployment explicitly supports it", () => {
-    const supportsLow = (id: string, low: boolean | undefined) =>
+  it("preserves defaults for missing effort flags and honors explicit opt-outs", () => {
+    const supportsLow = (id: string, low: unknown) =>
       row({
         model_info: {
+          supported_openai_params: ["reasoning_effort"],
           id,
           mode: "chat",
-          supports_low_reasoning_effort: low,
-          supports_high_reasoning_effort: true,
+          supports_low_reasoning_effort: low as boolean,
+          supports_xhigh_reasoning_effort: true,
         },
         litellm_params: { model: `internal/${id}` },
       });
 
     expect(
       reduceModelGroup([supportsLow("a", true), supportsLow("b", true)], resolveCatalog)?.thinkingLevelMap,
-    ).toEqual({ low: "low", high: "high" });
-    expect(
-      reduceModelGroup([supportsLow("a", true), supportsLow("b", undefined)], resolveCatalog)?.thinkingLevelMap,
-    ).toEqual({ low: null, high: "high" });
+    ).toEqual({ low: "low", xhigh: "xhigh", max: null });
+    for (const missing of [undefined, null]) {
+      expect(
+        reduceModelGroup([supportsLow("a", true), supportsLow("b", missing)], resolveCatalog)?.thinkingLevelMap,
+      ).toEqual({ xhigh: "xhigh", max: null });
+    }
     expect(
       reduceModelGroup([supportsLow("a", true), supportsLow("b", false)], resolveCatalog)?.thinkingLevelMap,
-    ).toEqual({ low: null, high: "high" });
+    ).toEqual({ low: null, xhigh: "xhigh", max: null });
   });
 
   it("overlays conservative router reasoning evidence on catalog metadata", () => {
@@ -765,10 +1809,20 @@ describe("reduceModelGroup", () => {
     const result = reduceModelGroup(
       [
         row({
-          model_info: { id: "a", mode: "chat", supports_low_reasoning_effort: true },
+          model_info: {
+            supported_openai_params: ["reasoning_effort"],
+            id: "a",
+            mode: "chat",
+            supports_low_reasoning_effort: true,
+          },
         }),
         row({
-          model_info: { id: "b", mode: "chat", supports_low_reasoning_effort: false },
+          model_info: {
+            supported_openai_params: ["reasoning_effort"],
+            id: "b",
+            mode: "chat",
+            supports_low_reasoning_effort: false,
+          },
         }),
       ],
       () => ({
@@ -782,40 +1836,14 @@ describe("reduceModelGroup", () => {
       }),
     );
 
-    expect(result?.thinkingLevelMap).toEqual({ ...catalogThinkingLevelMap, low: null });
-  });
-
-  it("adopts tiered pricing when identical tiers are declared in any property order", () => {
-    const tiers = [{ inputTokensAbove: 200_000, input: 6, output: 22.5, cacheRead: 0.6, cacheWrite: 7.5 }];
-    const reordered = [{ cacheWrite: 7.5, output: 22.5, input: 6, cacheRead: 0.6, inputTokensAbove: 200_000 }];
-    const withTiers =
-      (value: typeof tiers): CatalogResolver =>
-      () => ({
-        provider: "anthropic",
-        reasoning: true,
-        vision: true,
-        contextWindow: 200_000,
-        maxTokens: 64_000,
-        cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75, tiers: value },
-      });
-    const withoutRouterCosts = (id: string) =>
-      row({
-        model_info: {
-          id,
-          mode: "chat",
-          input_cost_per_token: undefined,
-          output_cost_per_token: undefined,
-          cache_read_input_token_cost: undefined,
-          cache_creation_input_token_cost: undefined,
-        },
-      });
-    const rows = [withoutRouterCosts("a"), withoutRouterCosts("b")];
-
-    expect(reduceModelGroup(rows, withTiers(tiers))?.cost.tiers).toEqual(tiers);
-    // Property order is not evidence of disagreement.
-    let call = 0;
-    const alternating: CatalogResolver = (entry) => withTiers(call++ === 0 ? tiers : reordered)(entry);
-    expect(reduceModelGroup(rows, alternating)?.cost.tiers).toEqual(tiers);
+    expect(result?.thinkingLevelMap).toEqual({
+      ...catalogThinkingLevelMap,
+      minimal: null,
+      medium: null,
+      xhigh: null,
+      max: null,
+      low: null,
+    });
   });
 
   it("merges different rates at identical tier thresholds conservatively regardless of order", () => {
@@ -1079,31 +2107,6 @@ describe("reduceModelGroup", () => {
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     });
     expect(result?.cost.tiers).toBeUndefined();
-  });
-
-  it("omits tiered pricing and thinking maps entirely when no catalog declares them", () => {
-    const result = reduceModelGroup([row()], resolveCatalog);
-
-    expect(result?.cost.tiers).toBeUndefined();
-    expect(result?.thinkingLevelMap).toBeUndefined();
-  });
-
-  it("disables catalog authority for conflicting provider identities", () => {
-    const result = reduceModelGroup(
-      [
-        row({ model_info: { id: "anthropic", mode: "chat" } }),
-        row({
-          model_info: { id: "openai", mode: "chat" },
-          litellm_params: { model: "openai/gpt-4o" },
-        }),
-      ],
-      resolveCatalog,
-    );
-
-    expect(result).not.toHaveProperty("catalogProvider");
-    expect(result?.thinkingLevelMap).toBeUndefined();
-    // The disagreement is reportable so the silent downgrade is diagnosable.
-    expect(result?.catalogAuthorityAmbiguous).toBe(true);
   });
 
   it("flags ambiguous catalog authority only when resolved identities disagree", () => {

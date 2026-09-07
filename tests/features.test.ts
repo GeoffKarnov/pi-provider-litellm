@@ -13,6 +13,7 @@ import {
   SessionManager,
 } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { LiteLLMModelPolicy } from "../src/types.js";
 import { createPi, loadExtension, type TestPi, useHermeticEnv } from "./test-helpers.js";
 
 useHermeticEnv(["PI_CODING_AGENT_DIR"]);
@@ -24,6 +25,20 @@ function jsonResponse(status: number, body: unknown): Response {
     status,
     headers: { "content-type": "application/json" },
   });
+}
+
+// `message_end` resolves the model that produced the message through the
+// registry, so display normalization reads the conclusion discovery persisted
+// instead of re-deriving a backend from the route name.
+function messageEndCtx(modelId: string, litellmPolicy?: Partial<LiteLLMModelPolicy>): unknown {
+  return {
+    modelRegistry: {
+      find: (provider: string, id: string) =>
+        provider === "litellm" && id === modelId
+          ? { id, provider, api: "openai-completions", ...(litellmPolicy ? { litellmPolicy } : {}) }
+          : undefined,
+    },
+  };
 }
 
 async function refreshProvider(pi: TestPi, allowNetwork = true, signal?: AbortSignal): Promise<void> {
@@ -855,7 +870,7 @@ describe("feature parity", () => {
     }
   });
 
-  it("does not send thinking for Kimi OpenAI completions requests", async () => {
+  it("normalizes think tags for opaque aliases whose requests merge Moonshot reasoning", async () => {
     const agentDir = await mkdtemp(join(tmpdir(), "pi-provider-litellm-"));
     process.env.LITELLM_BASE_URL = "https://proxy.example.com";
     process.env.LITELLM_API_KEY = "sk-test";
@@ -866,8 +881,8 @@ describe("feature parity", () => {
         return jsonResponse(200, {
           data: [
             {
-              model_name: "kimi-k3",
-              litellm_params: { model: "moonshot/kimi-k3" },
+              model_name: "k3-prod",
+              litellm_params: { model: "moonshot/kimi-k2.5" },
               model_info: { mode: "chat" },
             },
           ],
@@ -880,17 +895,47 @@ describe("feature parity", () => {
     const pi = createPi();
     await extension(pi);
     await refreshProvider(pi);
+    const model = pi.providers[0]?.getModels().find((candidate) => candidate.id === "k3-prod");
+    expect(model).toMatchObject({ litellmPolicy: { normalizeThinkTags: true, suppressReasoningVisibility: true } });
 
-    const beforeRequest = pi.handlers.get("before_provider_request")?.[0];
-    const model = pi.providers[0]?.getModels().find((candidate) => candidate.id === "kimi-k3");
-    expect(model).toMatchObject({ suppressReasoningContent: true });
-    const updated = beforeRequest?.({ payload: { messages: [] } }, { model });
-    expect(updated).toEqual({
-      messages: [],
-      include_reasoning: false,
-      reasoning_content: false,
-      merge_reasoning_content_in_choices: true,
-    });
+    let message: any = {
+      role: "assistant",
+      provider: "litellm",
+      model: "k3-prod",
+      content: [{ type: "text", text: "<think>internal reasoning</think>DONE" }],
+      usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 },
+    };
+    for (const handler of pi.handlers.get("message_end") ?? []) {
+      const result = await handler(
+        { message },
+        {
+          modelRegistry: {
+            find: (provider: string, id: string) => (provider === "litellm" && id === "k3-prod" ? model : undefined),
+          },
+        },
+      );
+      if (result?.message) message = result.message;
+    }
+
+    expect(message.content).toEqual([
+      { type: "thinking", thinking: "internal reasoning" },
+      { type: "text", text: "DONE" },
+    ]);
+
+    // The merge flag is never sent on Responses, so an opaque Responses alias is left alone.
+    const responsesModel = { ...model, api: "openai-responses" };
+    const untouched: any = {
+      role: "assistant",
+      provider: "litellm",
+      model: "k3-prod",
+      content: [{ type: "text", text: "<think>x</think>DONE" }],
+      usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 },
+    };
+    for (const handler of pi.handlers.get("message_end") ?? []) {
+      const result = await handler({ message: untouched }, { modelRegistry: { find: () => responsesModel } });
+      expect(result).toBeUndefined();
+    }
+    expect(untouched.content).toEqual([{ type: "text", text: "<think>x</think>DONE" }]);
   });
 
   it("keeps Moonshot suppression off routes that only look like Kimi", async () => {
@@ -927,12 +972,10 @@ describe("feature parity", () => {
       },
       { model: { provider: "litellm", id: "kimi-k3", api: "openai-completions" } },
     );
-    expect(updated).toEqual({
-      messages: [{ role: "tool", tool_call_id: "call_1", content: "tool output" }],
-    });
+    expect(updated).toBeUndefined();
   });
 
-  it("does not suppress reasoning for forced public or backend discovered models", async () => {
+  it("does not suppress reasoning for always-thinking backend models", async () => {
     const agentDir = await mkdtemp(join(tmpdir(), "pi-provider-litellm-"));
     process.env.LITELLM_BASE_URL = "https://proxy.example.com";
     process.env.LITELLM_API_KEY = "sk-test";
@@ -944,7 +987,7 @@ describe("feature parity", () => {
           data: [
             {
               model_name: "kimi-k2-thinking",
-              litellm_params: { model: "moonshot/kimi-k3" },
+              litellm_params: { model: "moonshot/kimi-k2-thinking" },
               model_info: { mode: "chat" },
             },
             {
@@ -971,6 +1014,76 @@ describe("feature parity", () => {
     }
   });
 
+  it("does not send thinking for Kimi OpenAI completions requests", async () => {
+    const agentDir = await mkdtemp(join(tmpdir(), "pi-provider-litellm-"));
+    process.env.LITELLM_BASE_URL = "https://proxy.example.com";
+    process.env.LITELLM_API_KEY = "sk-test";
+
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = String(input);
+      if (url.endsWith("/model/info")) {
+        return jsonResponse(200, {
+          data: [
+            {
+              model_name: "kimi-k3",
+              litellm_params: { model: "moonshot/kimi-k3" },
+              model_info: { mode: "chat" },
+            },
+          ],
+        });
+      }
+      throw new Error(`unexpected URL: ${url}`);
+    });
+
+    const extension = await loadExtension(agentDir);
+    const pi = createPi();
+    await extension(pi);
+    await refreshProvider(pi);
+
+    const beforeRequest = pi.handlers.get("before_provider_request")?.[0];
+    const model = pi.providers[0]?.getModels().find((candidate) => candidate.id === "kimi-k3");
+    expect(model).toMatchObject({ litellmPolicy: { suppressReasoningVisibility: true } });
+    const updated = beforeRequest?.({ payload: { messages: [] } }, { model });
+    expect(updated).toEqual({
+      messages: [],
+      include_reasoning: false,
+      reasoning_content: false,
+      merge_reasoning_content_in_choices: true,
+    });
+  });
+
+  it("does not inject reasoning controls from a Kimi-looking public route", async () => {
+    const agentDir = await mkdtemp(join(tmpdir(), "pi-provider-litellm-"));
+    process.env.LITELLM_BASE_URL = "https://proxy.example.com";
+    process.env.LITELLM_API_KEY = "sk-test";
+
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = String(input);
+      if (url.endsWith("/model/info")) {
+        return jsonResponse(200, {
+          data: [
+            {
+              model_name: "kimi-k3",
+              model_info: { mode: "chat" },
+            },
+          ],
+        });
+      }
+      throw new Error(`unexpected URL: ${url}`);
+    });
+
+    const extension = await loadExtension(agentDir);
+    const pi = createPi();
+    await extension(pi);
+
+    const beforeRequest = pi.handlers.get("before_provider_request")?.[0];
+    const updated = beforeRequest?.(
+      { payload: { messages: [] } },
+      { model: { provider: "litellm", id: "kimi-k3", api: "openai-completions" } },
+    );
+    expect(updated).toBeUndefined();
+  });
+
   it("leaves payloads for an unregistered API unchanged", async () => {
     const agentDir = await mkdtemp(join(tmpdir(), "pi-provider-litellm-"));
     process.env.LITELLM_BASE_URL = "https://proxy.example.com";
@@ -990,7 +1103,18 @@ describe("feature parity", () => {
     const beforeRequest = pi.handlers.get("before_provider_request")?.[0];
     const updated = beforeRequest?.(
       { payload },
-      { model: { provider: "litellm", id: "kimi-k2.6", api: "anthropic-messages" } },
+      {
+        model: {
+          provider: "litellm",
+          id: "kimi-k2.6",
+          api: "anthropic-messages",
+          litellmPolicy: {
+            normalizeStrictToolMessages: true,
+            normalizeThinkTags: true,
+            suppressReasoningVisibility: true,
+          },
+        },
+      },
     );
 
     expect(updated).toBeUndefined();
@@ -1015,7 +1139,18 @@ describe("feature parity", () => {
     const beforeRequest = pi.handlers.get("before_provider_request")?.[0];
     const updated = beforeRequest?.(
       { payload: { input: [{ type: "message", role: "user", content: "hi" }] } },
-      { model: { provider: "litellm", id: "kimi-k2.6", api: "openai-responses" } },
+      {
+        model: {
+          provider: "litellm",
+          id: "kimi-k2.6",
+          api: "openai-responses",
+          litellmPolicy: {
+            normalizeStrictToolMessages: true,
+            normalizeThinkTags: true,
+            suppressReasoningVisibility: true,
+          },
+        },
+      },
     );
 
     expect(updated).toBeUndefined();
@@ -1026,17 +1161,7 @@ describe("feature parity", () => {
     process.env.LITELLM_BASE_URL = "https://proxy.example.com";
     process.env.LITELLM_API_KEY = "sk-test";
 
-    vi.spyOn(globalThis, "fetch").mockResolvedValue(
-      jsonResponse(200, {
-        data: [
-          {
-            model_name: "kimi-k3",
-            litellm_params: { model: "moonshot/kimi-k3" },
-            model_info: { mode: "chat" },
-          },
-        ],
-      }),
-    );
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse(200, { data: [] }));
 
     const extension = await loadExtension(agentDir);
     const pi = createPi();
@@ -1057,7 +1182,17 @@ describe("feature parity", () => {
           ],
         },
       },
-      { model: { provider: "litellm", id: "kimi-k3", suppressReasoningContent: true } },
+      {
+        model: {
+          provider: "litellm",
+          id: "kimi-k3",
+          litellmPolicy: {
+            normalizeStrictToolMessages: true,
+            normalizeThinkTags: true,
+            suppressReasoningVisibility: true,
+          },
+        },
+      },
     );
 
     expect(updated).toEqual({
@@ -1081,17 +1216,7 @@ describe("feature parity", () => {
     process.env.LITELLM_BASE_URL = "https://proxy.example.com";
     process.env.LITELLM_API_KEY = "sk-test";
 
-    vi.spyOn(globalThis, "fetch").mockResolvedValue(
-      jsonResponse(200, {
-        data: [
-          {
-            model_name: "kimi-k3",
-            litellm_params: { model: "moonshot/kimi-k3" },
-            model_info: { mode: "chat" },
-          },
-        ],
-      }),
-    );
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse(200, { data: [] }));
 
     const extension = await loadExtension(agentDir);
     const pi = createPi();
@@ -1116,7 +1241,17 @@ describe("feature parity", () => {
           ],
         },
       },
-      { model: { provider: "litellm", id: "kimi-k3", suppressReasoningContent: true } },
+      {
+        model: {
+          provider: "litellm",
+          id: "kimi-k3",
+          litellmPolicy: {
+            normalizeStrictToolMessages: true,
+            normalizeThinkTags: true,
+            suppressReasoningVisibility: true,
+          },
+        },
+      },
     );
 
     expect(updated).toEqual({
@@ -1143,17 +1278,7 @@ describe("feature parity", () => {
     process.env.LITELLM_BASE_URL = "https://proxy.example.com";
     process.env.LITELLM_API_KEY = "sk-test";
 
-    vi.spyOn(globalThis, "fetch").mockResolvedValue(
-      jsonResponse(200, {
-        data: [
-          {
-            model_name: "kimi-k3",
-            litellm_params: { model: "moonshot/kimi-k3" },
-            model_info: { mode: "chat" },
-          },
-        ],
-      }),
-    );
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse(200, { data: [] }));
 
     const extension = await loadExtension(agentDir);
     const pi = createPi();
@@ -1170,10 +1295,55 @@ describe("feature parity", () => {
     const beforeRequest = pi.handlers.get("before_provider_request")?.[0];
     const updated = beforeRequest?.(
       { payload: { messages } },
-      { model: { provider: "litellm", id: "kimi-k3", suppressReasoningContent: true } },
+      {
+        model: {
+          provider: "litellm",
+          id: "kimi-k3",
+          litellmPolicy: {
+            normalizeStrictToolMessages: true,
+            normalizeThinkTags: true,
+            suppressReasoningVisibility: true,
+          },
+        },
+      },
     );
 
-    expect(updated?.messages).toBe(messages);
+    expect(updated).toEqual({
+      messages,
+      include_reasoning: false,
+      reasoning_content: false,
+      merge_reasoning_content_in_choices: true,
+    });
+  });
+
+  it("leaves strict-schema tool messages untouched for a Moonshot-looking model without repair policy", async () => {
+    const agentDir = await mkdtemp(join(tmpdir(), "pi-provider-litellm-"));
+    process.env.LITELLM_BASE_URL = "https://litellm.example.com";
+    process.env.LITELLM_API_KEY = "sk-test";
+
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse(200, { data: [] }));
+
+    const extension = await loadExtension(agentDir);
+    const pi = createPi();
+    await extension(pi);
+
+    const beforeRequest = pi.handlers.get("before_provider_request")?.[0];
+    const updated = beforeRequest?.(
+      {
+        payload: {
+          messages: [
+            {
+              role: "assistant",
+              content: null,
+              tool_calls: [{ id: "call_1", type: "function", function: { name: "noop", arguments: "{}" } }],
+            },
+          ],
+        },
+      },
+      { model: { provider: "litellm", id: "kimi-k2.6" } },
+    );
+
+    expect(updated).toBeUndefined();
   });
 
   it("leaves strict-schema tool messages untouched for non-Moonshot models", async () => {
@@ -1386,7 +1556,18 @@ describe("feature parity", () => {
           reasoning: { effort: "HIGH", summary: "auto" },
         },
       },
-      { model: { provider: "litellm", id: "google/gemini-3.1-pro-preview" } },
+      {
+        model: {
+          provider: "litellm",
+          id: "opaque-gemini-route",
+          litellmPolicy: {
+            normalizeStrictToolMessages: false,
+            normalizeThinkTags: false,
+            suppressReasoningVisibility: false,
+            normalizeGeminiReasoningEffort: true,
+          },
+        },
+      },
     );
 
     expect(updated).toEqual({
@@ -1404,12 +1585,12 @@ describe("feature parity", () => {
             reasoning: { effort: "MAX_THINKING", summary: "auto" },
           },
         },
-        { model: { provider: "litellm", id: "custom/reasoner" } },
+        { model: { provider: "litellm", id: "google/gemini-3.1-pro-preview" } },
       ),
     ).toBeUndefined();
   });
 
-  it("normalizes Kimi think tags into Pi thinking blocks", async () => {
+  it("normalizes route-only Kimi think tags from the discovered policy", async () => {
     const agentDir = await mkdtemp(join(tmpdir(), "pi-provider-litellm-"));
     process.env.LITELLM_BASE_URL = "https://proxy.example.com";
     process.env.LITELLM_API_KEY = "sk-test";
@@ -1421,50 +1602,6 @@ describe("feature parity", () => {
           data: [
             {
               model_name: "kimi-k2.6",
-              litellm_params: { model: "azure_ai/FW-Kimi-K2.6" },
-              model_info: { mode: "chat" },
-            },
-          ],
-        });
-      }
-      throw new Error(`unexpected URL: ${url}`);
-    });
-
-    const extension = await loadExtension(agentDir);
-    const pi = createPi();
-    await extension(pi);
-
-    let message: any = {
-      role: "assistant",
-      provider: "litellm",
-      model: "kimi-k2.6",
-      content: [{ type: "text", text: "<think>internal reasoning</think>DONE" }],
-      usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 },
-    };
-    for (const handler of pi.handlers.get("message_end") ?? []) {
-      const result = await handler({ message });
-      if (result?.message) message = result.message;
-    }
-
-    expect(message.content).toEqual([
-      { type: "thinking", thinking: "internal reasoning" },
-      { type: "text", text: "DONE" },
-    ]);
-  });
-
-  it("normalizes think tags for opaque aliases whose requests merge Moonshot reasoning", async () => {
-    const agentDir = await mkdtemp(join(tmpdir(), "pi-provider-litellm-"));
-    process.env.LITELLM_BASE_URL = "https://proxy.example.com";
-    process.env.LITELLM_API_KEY = "sk-test";
-
-    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
-      const url = String(input);
-      if (url.endsWith("/model/info")) {
-        return jsonResponse(200, {
-          data: [
-            {
-              model_name: "k3-prod",
-              litellm_params: { model: "moonshot/kimi-k2.5" },
               model_info: { mode: "chat" },
             },
           ],
@@ -1477,47 +1614,70 @@ describe("feature parity", () => {
     const pi = createPi();
     await extension(pi);
     await refreshProvider(pi);
-    const model = pi.providers[0]?.getModels().find((candidate) => candidate.id === "k3-prod");
-    expect(model).toMatchObject({ suppressReasoningContent: true });
+    const discovered = pi.providers[0]?.getModels().find((model) => model.id === "kimi-k2.6") as
+      | { litellmPolicy?: LiteLLMModelPolicy }
+      | undefined;
 
     let message: any = {
       role: "assistant",
       provider: "litellm",
-      model: "k3-prod",
+      model: "kimi-k2.6",
       content: [{ type: "text", text: "<think>internal reasoning</think>DONE" }],
       usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 },
     };
-    for (const handler of pi.handlers.get("message_end") ?? []) {
-      const result = await handler(
-        { message },
-        {
-          modelRegistry: {
-            find: (provider: string, id: string) => (provider === "litellm" && id === "k3-prod" ? model : undefined),
-          },
-        },
-      );
+    const handlers = pi.handlers.get("message_end") ?? [];
+    expect(handlers.length).toBeGreaterThan(0);
+    for (const handler of handlers) {
+      const result = await handler({ message }, messageEndCtx(message.model, discovered?.litellmPolicy));
       if (result?.message) message = result.message;
     }
 
+    expect(discovered?.litellmPolicy).toEqual({
+      normalizeStrictToolMessages: false,
+      normalizeThinkTags: true,
+      suppressReasoningVisibility: false,
+    });
     expect(message.content).toEqual([
       { type: "thinking", thinking: "internal reasoning" },
       { type: "text", text: "DONE" },
     ]);
+  });
 
-    // The merge flag is never sent on Responses, so an opaque Responses alias is left alone.
-    const responsesModel = { ...model, api: "openai-responses" };
-    const untouched: any = {
+  it.each([
+    { name: "a Kimi-shaped route carrying no display conclusion", policy: undefined, modelId: "kimi-k2.6" },
+    {
+      name: "a route whose discovered conclusion declines normalization",
+      policy: { normalizeThinkTags: false, suppressReasoningVisibility: false },
+      modelId: "kimi-k2.6",
+    },
+  ])("leaves think tags alone for $name", async ({ policy, modelId }) => {
+    const agentDir = await mkdtemp(join(tmpdir(), "pi-provider-litellm-"));
+    process.env.LITELLM_BASE_URL = "https://litellm.example.com";
+    process.env.LITELLM_API_KEY = "sk-test";
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse(200, { data: [] }));
+
+    const extension = await loadExtension(agentDir);
+    const pi = createPi();
+    await extension(pi);
+
+    // A Kimi-shaped id with inline think tags: only the absent/negative
+    // conclusion stops the rewrite, so this fails if the hook reads the id.
+    const message = {
       role: "assistant",
       provider: "litellm",
-      model: "k3-prod",
-      content: [{ type: "text", text: "<think>x</think>DONE" }],
+      model: modelId,
+      content: [{ type: "text", text: "<think>internal reasoning</think>DONE" }],
       usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 },
     };
-    for (const handler of pi.handlers.get("message_end") ?? []) {
-      const result = await handler({ message: untouched }, { modelRegistry: { find: () => responsesModel } });
-      expect(result).toBeUndefined();
+    const handlers = pi.handlers.get("message_end") ?? [];
+    expect(handlers.length).toBeGreaterThan(0);
+    const results = [];
+    for (const handler of handlers) {
+      results.push(await handler({ message }, messageEndCtx(modelId, policy)));
     }
-    expect(untouched.content).toEqual([{ type: "text", text: "<think>x</think>DONE" }]);
+
+    expect(results.every((result) => result?.message === undefined)).toBe(true);
+    expect(message.content).toEqual([{ type: "text", text: "<think>internal reasoning</think>DONE" }]);
   });
 
   it("keeps final Kimi text visible when a dangling think tag prefixes it", async () => {
@@ -1551,8 +1711,17 @@ describe("feature parity", () => {
       content: [{ type: "text", text: "<think>DONE" }],
       usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 },
     };
-    for (const handler of pi.handlers.get("message_end") ?? []) {
-      const result = await handler({ message });
+    const handlers = pi.handlers.get("message_end") ?? [];
+    expect(handlers.length).toBeGreaterThan(0);
+    for (const handler of handlers) {
+      const result = await handler(
+        { message },
+        messageEndCtx(message.model, {
+          normalizeStrictToolMessages: true,
+          normalizeThinkTags: true,
+          suppressReasoningVisibility: true,
+        }),
+      );
       if (result?.message) message = result.message;
     }
 
