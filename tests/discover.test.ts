@@ -2164,7 +2164,7 @@ describe("discoverModels via /model/info", () => {
           litellm_provider: "azure",
         },
       },
-      true,
+      false,
     ],
     [
       "Bedrock-hosted Kimi",
@@ -2177,7 +2177,7 @@ describe("discoverModels via /model/info", () => {
           litellm_provider: "bedrock_converse",
         },
       },
-      true,
+      false,
     ],
     [
       "opaque Moonshot alias",
@@ -2188,20 +2188,21 @@ describe("discoverModels via /model/info", () => {
       },
       true,
     ],
-  ] as const)("derives reasoning visibility from backend family evidence for %s", async (_name, entry, suppress) => {
+  ] as const)("derives reasoning visibility from Moonshot routing evidence for %s", async (_name, entry, suppress) => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse(200, { data: [entry] }));
 
     const result = await discoverModels("https://litellm.example.com", "sk-test", {});
 
-    expect(result.models[0]?.litellmPolicy?.suppressReasoningVisibility === true).toBe(suppress);
+    expect(result.models[0]?.litellmPolicy?.suppressReasoningVisibility).toBe(suppress);
+    expect(result.models[0]?.litellmPolicy?.normalizeThinkTags).toBe(true);
   });
 
   it.each([
-    ["Moonshot deployments", ["moonshot/kimi-k3", "moonshot/kimi-k3"], true],
-    ["mixed deployments", ["moonshot/kimi-k3", "azure_ai/FW-Kimi-K3"], true],
-    ["reversed mixed deployments", ["azure_ai/FW-Kimi-K3", "moonshot/kimi-k3"], true],
-    ["incomplete deployment metadata", ["moonshot/kimi-k3", undefined], false],
-  ] as const)("aggregates %s conservatively", async (_name, routes, suppress) => {
+    ["Moonshot deployments", ["moonshot/kimi-k3", "moonshot/kimi-k3"], true, true],
+    ["mixed deployments", ["moonshot/kimi-k3", "azure_ai/FW-Kimi-K3"], false, true],
+    ["reversed mixed deployments", ["azure_ai/FW-Kimi-K3", "moonshot/kimi-k3"], false, true],
+    ["incomplete deployment metadata", ["moonshot/kimi-k3", undefined], false, false],
+  ] as const)("requires Moonshot transport for suppression across %s", async (_name, routes, suppress, normalize) => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(
       jsonResponse(200, {
         data: routes.map((model) => ({
@@ -2214,7 +2215,8 @@ describe("discoverModels via /model/info", () => {
 
     const result = await discoverModels("https://litellm.example.com", "sk-test", { modelsDev: false });
 
-    expect(result.models[0]?.litellmPolicy?.suppressReasoningVisibility === true).toBe(suppress);
+    expect(result.models[0]?.litellmPolicy?.suppressReasoningVisibility).toBe(suppress);
+    expect(result.models[0]?.litellmPolicy?.normalizeThinkTags).toBe(normalize);
   });
 
   it.each([
@@ -2263,7 +2265,7 @@ describe("discoverModels via /model/info", () => {
           litellm_provider: "azure",
         },
       },
-      true,
+      false,
     ],
     [
       "Bedrock-hosted Kimi",
@@ -2276,7 +2278,7 @@ describe("discoverModels via /model/info", () => {
           litellm_provider: "bedrock_converse",
         },
       },
-      true,
+      false,
     ],
     [
       "Moonshot-hosted opaque alias",
@@ -2287,13 +2289,17 @@ describe("discoverModels via /model/info", () => {
       },
       true,
     ],
-  ] as const)("keeps reasoning visibility independent of hosting transport for %s", async (_name, entry, suppress) => {
-    vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse(200, { data: [entry] }));
+  ] as const)(
+    "keeps think-tag normalization independent of hosting transport for %s",
+    async (_name, entry, suppress) => {
+      vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse(200, { data: [entry] }));
 
-    const result = await discoverModels("https://litellm.example.com", "sk-test", { modelsDev: false });
+      const result = await discoverModels("https://litellm.example.com", "sk-test", { modelsDev: false });
 
-    expect(result.models[0]?.litellmPolicy?.suppressReasoningVisibility === true).toBe(suppress);
-  });
+      expect(result.models[0]?.litellmPolicy?.suppressReasoningVisibility).toBe(suppress);
+      expect(result.models[0]?.litellmPolicy?.normalizeThinkTags).toBe(true);
+    },
+  );
 
   it("does not suppress an alias routed to a forced-thinking Moonshot model", async () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(
@@ -2314,12 +2320,13 @@ describe("discoverModels via /model/info", () => {
   });
 
   it.each([
-    ["provider-only metadata", { custom_llm_provider: "moonshot" }],
+    ["provider-only metadata", { custom_llm_provider: "moonshot" }, true],
     [
       "Moonshot provider and Azure-hosted Kimi backend",
       { custom_llm_provider: "moonshot", model: "azure_ai/FW-Kimi-K3" },
+      false,
     ],
-  ])("uses Kimi family evidence with %s", async (_name, litellm_params) => {
+  ] as const)("checks every declared Moonshot routing signal with %s", async (_name, litellm_params, suppress) => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(
       jsonResponse(200, {
         data: [{ model_name: "kimi-prod", litellm_params, model_info: { mode: "chat" } }],
@@ -2328,7 +2335,8 @@ describe("discoverModels via /model/info", () => {
 
     const result = await discoverModels("https://litellm.example.com", "sk-test", { modelsDev: false });
 
-    expect(result.models[0]?.litellmPolicy?.suppressReasoningVisibility).toBe(true);
+    expect(result.models[0]?.litellmPolicy?.suppressReasoningVisibility).toBe(suppress);
+    expect(result.models[0]?.litellmPolicy?.normalizeThinkTags).toBe(true);
   });
 
   it("keeps route evidence isolated between discoveries", async () => {
@@ -2690,7 +2698,7 @@ describe("discoverModels via /model/info", () => {
   });
 
   it.each(["openai", "custom_openai", "openai_like", "text-completion-openai", "azure", "azure_ai"])(
-    "treats the %s adapter as transport when the model identifies Kimi",
+    "keeps Kimi generation controls on the %s transport",
     async (adapter) => {
       mockEndpoints({
         "/model/info": () =>
@@ -2710,7 +2718,7 @@ describe("discoverModels via /model/info", () => {
         litellmPolicy: {
           normalizeStrictToolMessages: true,
           normalizeThinkTags: true,
-          suppressReasoningVisibility: true,
+          suppressReasoningVisibility: false,
         },
       });
     },
@@ -2747,7 +2755,7 @@ describe("discoverModels via /model/info", () => {
     },
   );
 
-  it("publishes Kimi compatibility when an OpenAI transport adapter routes openai/kimi", async () => {
+  it("publishes Kimi compatibility without Moonshot request parameters through an OpenAI transport", async () => {
     mockEndpoints({
       "/model/info": () =>
         jsonResponse(200, {
@@ -2776,7 +2784,7 @@ describe("discoverModels via /model/info", () => {
       litellmPolicy: {
         normalizeStrictToolMessages: true,
         normalizeThinkTags: true,
-        suppressReasoningVisibility: true,
+        suppressReasoningVisibility: false,
       },
     });
   });
