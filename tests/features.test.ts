@@ -1503,6 +1503,21 @@ describe("feature parity", () => {
       { type: "thinking", thinking: "internal reasoning" },
       { type: "text", text: "DONE" },
     ]);
+
+    // The merge flag is never sent on Responses, so an opaque Responses alias is left alone.
+    const responsesModel = { ...model, api: "openai-responses" };
+    const untouched: any = {
+      role: "assistant",
+      provider: "litellm",
+      model: "k3-prod",
+      content: [{ type: "text", text: "<think>x</think>DONE" }],
+      usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 },
+    };
+    for (const handler of pi.handlers.get("message_end") ?? []) {
+      const result = await handler({ message: untouched }, { modelRegistry: { find: () => responsesModel } });
+      expect(result).toBeUndefined();
+    }
+    expect(untouched.content).toEqual([{ type: "text", text: "<think>x</think>DONE" }]);
   });
 
   it("keeps final Kimi text visible when a dangling think tag prefixes it", async () => {
