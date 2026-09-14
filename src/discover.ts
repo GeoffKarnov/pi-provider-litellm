@@ -148,6 +148,11 @@ function supportsResponses(entry: ModelInfoEntry): boolean {
   return date !== undefined && date >= "2025-03-01";
 }
 
+function forceCompletions(model: DiscoveredModel, modelId: string): void {
+  model.api = "openai-completions";
+  model.compat = completionsCompat(modelId);
+}
+
 export function modelProtocol(modelId: string, modeOrEntry?: string | null | ModelInfoEntry): ModelProtocol {
   const selectedEntry =
     typeof modeOrEntry === "object" && modeOrEntry !== null
@@ -529,9 +534,7 @@ function deduplicateModels(models: DiscoveredModel[]): DiscoveredModel[] {
     const deduplicated = { ...model };
     if (aggregateSuppressionEvidence(suppressions)) deduplicated.suppressReasoningContent = true;
     else delete deduplicated.suppressReasoningContent;
-    if (chat && deduplicated.api !== "openai-completions") {
-      Object.assign(deduplicated, { api: "openai-completions", compat: completionsCompat(model.id) });
-    }
+    if (chat) forceCompletions(deduplicated, model.id);
     // The family gates the OpenAI-only tool-cap preflight; deployments that disagree cannot authorize it.
     if (families.size !== 1) delete deduplicated.litellmBackendFamily;
     return deduplicated;
@@ -576,9 +579,7 @@ export async function discoverModels(
       .map(([id, entry]) => {
         const model = mapFromModelInfo(entry, aggregateSuppressionEvidence(suppressionEvidence.get(id)!));
         if (!model) return undefined;
-        if (protocolEvidence.get(id)?.has("openai-completions")) {
-          Object.assign(model, { api: "openai-completions", compat: completionsCompat(id) });
-        }
+        if (protocolEvidence.get(id)?.has("openai-completions")) forceCompletions(model, id);
         const families = backendFamilyEvidence.get(id);
         if (families?.size !== 1) delete model.litellmBackendFamily;
         return model;
