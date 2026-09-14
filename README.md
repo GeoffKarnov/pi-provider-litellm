@@ -70,7 +70,7 @@ export LITELLM_BASE_URL="https://litellm.your-domain.com"
 export LITELLM_API_KEY="sk-..."
 ```
 
-Stored pi credentials for `litellm` take precedence over `LITELLM_API_KEY`; the environment key is used when no saved credential exists. `LITELLM_BASE_URL` is used when no saved login base URL exists.
+Stored pi credentials for `litellm` take precedence over `LITELLM_API_KEY`; the environment key is used when no saved credential exists. `LITELLM_BASE_URL` is used when no saved login base URL exists. Chat Completions and Responses models use the proxy root plus `/v1`.
 
 ### Multiple LiteLLM provider aliases
 
@@ -115,7 +115,7 @@ Provider fields:
 
 | Field | Default | Effect |
 |---|---|---|
-| `baseUrl` | `LITELLM_BASE_URL` for `litellm`; required for aliases | LiteLLM proxy URL, with or without `/v1` |
+| `baseUrl` | `LITELLM_BASE_URL` for `litellm`; required for aliases | LiteLLM proxy URL, with or without `/v1`. Must be a full `http`/`https` URL; a provider with no resolvable base URL exposes no models (see [Model host enforcement](#model-host-enforcement)) |
 | `apiKey` | `LITELLM_API_KEY_HELPER`/`LITELLM_API_KEY` for `litellm`; required for aliases | Pi config value for this provider's key. Use `$ENV_VAR`, `${ENV_VAR}`, `!command`, or a literal key. Escape a literal `$` as `$$`. |
 | `headers` | `$LITELLM_HEADERS` for `litellm`; unset for aliases | JSON string env reference or inline object of request headers |
 | `displayName` | provider name | Label shown in Pi UI |
@@ -163,7 +163,7 @@ adding transport-specific fields to request bodies.
 | `LITELLM_HEADERS` | unset | JSON object of extra headers sent to LiteLLM provider, discovery, MCP, and Skills Gateway requests. Provider aliases can use it with `"headers": "$LITELLM_HEADERS"`. |
 | `LITELLM_GCLOUD_TOKEN_AUTH` | unset | If set to a non-empty value other than `0`, use Google Application Default Credentials as the LiteLLM bearer token source. This takes precedence over `LITELLM_API_KEY_HELPER` and `LITELLM_API_KEY` when no stored `/login litellm` credential exists. |
 | `GOOGLE_APPLICATION_CREDENTIALS` | Google default ADC path | Optional path to an ADC JSON file used by `LITELLM_GCLOUD_TOKEN_AUTH`. If unset, the extension checks the default gcloud ADC locations. |
-| `LITELLM_OFFLINE` | unset | If `1`, disable all model and MCP discovery, including post-login discovery; use cached models only |
+| `LITELLM_OFFLINE` | unset | If `1`, disable all model and MCP discovery, including post-login discovery; use cached models only when their stored root, including any path prefix, matches the active credential root |
 | `LITELLM_DISCOVERY_TIMEOUT_MS` | `5000` | Background and explicit discovery fetch timeout in ms; `0` disables automatic discovery |
 | `LITELLM_CLI_JWT_EXPIRATION_HOURS` | `24` | CLI SSO token lifetime fallback for older proxies whose poll response omits `expires_in`; mirror a non-default proxy setting locally |
 | `LITELLM_VERBOSE_DISCOVERY` | unset | If `1`, enable progress messages during model and MCP discovery (login, refresh, startup), including MCP prepared/registered/dropped counts. Progress messages are off by default; MCP safety diagnostics (see below) are always reported regardless of this setting |
@@ -284,6 +284,33 @@ Dynamic catalogs are persisted by Pi in `~/.pi/agent/models-store.json`. Credent
 
 Opening `/model` refreshes configured provider catalogs in the background using Pi's native model lifecycle.
 
+### Model host enforcement
+
+Models this provider dispatches are sent to the root resolved from the active credential. The extension hides a model from `/model` when its stored root, including any path prefix, does not match that credential, and its dispatch-time guard rejects stale, malformed, placeholder, and unsupported models before a request. For accepted models, the request URL is re-derived from the credential's proxy root instead of trusting a configured model URL. Explicit `allowInsecureHttp` settings continue to apply to this validation.
+
+Catalog filtering and dispatch are separate. Choosing a model by ID or restoring it from a session can skip filtering. Pi 0.84 routes such a model to the provider only when the provider's current catalog already contains the same `api`. The native `Provider` contract has no separate protocol-capability declaration. If the catalog contains no model for that API, Pi uses its global API implementation instead, bypassing this extension's dispatch-time host guard. The extension deliberately returns an ordinary model array rather than falsifying its contents through an overridden Array method.
+
+To keep that fallback safe, resolved auth carries `baseUrl` set to the credential's proxy root. Pi applies it to every request path — the provider guard and the global fallback alike — so a stale, placeholder, or attacker-supplied model `baseUrl` is replaced with the credential root before the request leaves the process. The credential can only ever reach the host it was issued for. A model whose `api` is absent from the catalog may still fail to complete on the fallback path (the global implementation builds a slightly different URL), but it cannot exfiltrate the credential. When no usable root resolves, auth carries no `baseUrl` and the provider guard rejects the request outright.
+
+Opening `/model` against the active proxy repopulates the protocols discovery actually selects, which is the supported way to use a model whose `api` is currently absent from the catalog.
+
+A model is hidden when:
+
+- no base URL resolves from settings or credentials
+- the base URL is invalid or remains the `https://litellm.example.com` placeholder
+- its stored root differs from the active credential root, such as after switching proxies or path-scoped tenants
+- it declares an API this extension does not implement
+
+Each distinct availability diagnostic is written once per session on stderr. `LITELLM_OFFLINE=1` does not recover a root mismatch: refresh online against the active proxy first, then return to offline use.
+
+### Protocols and prompt caching
+
+Discovery selects Responses for OpenAI-family backends and Chat Completions for other OpenAI-compatible backends. An Azure deployment with an explicit `api_version` older than `2025-03-01-preview` stays on Chat Completions; an unset or newer version uses Responses. Azure is detected from the adapter field, an `azure/` or `azure_ai/` model prefix, or the reported provider; other adapters follow the backend family because LiteLLM bridges `/v1/responses` to Chat Completions when the provider has no native Responses config (`litellm/responses/main.py`, `_bridges_to_chat_completions`). A route whose model prefix and `custom_llm_provider` name different providers is treated as unidentified and stays on Chat Completions, so it also does not get the local 128-tool preflight. When `/model/info` supplies `supported_endpoints`, that list takes precedence, and `mode: "responses"` remains an explicit Responses signal. An evidence-free fallback entry—a bare `/v1/models` id or a `/health` entry with no detail row—takes its protocol and presentation metadata from the Pi catalog entry for its id; an unknown id stays on Chat Completions. The route name alone authorizes nothing. A concrete id expanded from wildcard `/model/info` routes inherits the deployment evidence of the wildcard route LiteLLM would select for it, with the requested id substituted into the row's `model` the way LiteLLM serves it; the id is omitted when that selected route is not a published chat-style route. These two protocols are the whole set this provider implements, and both use `<root>/v1`. Anthropic Messages support is a separate change; a protocol is added here only together with the discovery mapping that selects it and routes it through the provider's host guard. When an evidence-free cached `(no metadata)` entry can be enriched from the Pi catalog, it is restored on Responses only for a catalog Responses model and otherwise on Chat Completions, never Anthropic Messages. A model supplied only through `models.json` whose `api` this provider does not implement takes Pi's global API fallback rather than this provider's host guard; the credential-root pin (see [Model host enforcement](#model-host-enforcement)) still keeps the credential on the active proxy.
+
+`cacheControlFormat: "anthropic"` applies only to Chat Completions, where Pi adds Anthropic `cache_control` markers. The Responses transport has a different compatibility type and uses native `prompt_cache_key` (plus supported retention fields), so Responses models must not receive `cacheControlFormat`. Freshly discovered OpenAI-family models forced onto Chat Completions are rejected locally when a request contains more than 128 tools; route them through Responses or reduce enabled extensions. Moonshot request-side reasoning suppression follows LiteLLM's routing provider, not `model_info.base_model`; response-side `<think>` normalization follows that suppression flag as well as Moonshot-named model ids, so opaque Moonshot aliases are normalized without sending Moonshot-only parameters to Azure- or Bedrock-hosted Kimi models.
+
+Discovery policy is versioned in Pi's persisted model catalog. After upgrading, an online refresh replaces legacy entries. Offline legacy entries remain usable without a diagnostic; the extension reports the discovery-version mismatch once only when an attempted online refresh fails. To force rediscovery or roll back across this policy change, delete the `litellm` entry from `~/.pi/agent/models-store.json` (or delete the file) and refresh once online.
+
 ## Troubleshooting
 
 | Symptom | Likely cause |
@@ -292,7 +319,9 @@ Opening `/model` refreshes configured provider catalogs in the background using 
 | `No models available` at startup, gone after a restart | A Pi startup race, not discovery — see [`No models available` at startup](#no-models-available-at-startup) |
 | "discovered no models" | Proxy returned an empty list — check pi's startup log and verify `/model/info`, `/v1/models`, or `/health` responds |
 | `/model/info` returning 401/403/404 | Expected behavior with virtual keys — extension falls back to `/v1/models` |
-| Discovery times out | Increase `LITELLM_DISCOVERY_TIMEOUT_MS` or set `LITELLM_OFFLINE=1` to fall back on cached models |
+| Discovery times out | Increase `LITELLM_DISCOVERY_TIMEOUT_MS` or set `LITELLM_OFFLINE=1` to fall back on cached models. Offline mode does not recover a root mismatch, including a different path prefix — see [Model host enforcement](#model-host-enforcement) |
+| A provider shows no models | The base URL is missing, invalid, still the placeholder, or its full root, including any path prefix, differs from the root in the cached catalog. Check stderr and see [Model host enforcement](#model-host-enforcement) |
+| A configured or restored model fails to complete but never leaks the credential | Its `api` is absent from the current provider catalog, so Pi used global API fallback with the credential root pinned. Open `/model` against the active proxy to repopulate the protocol — see [Model host enforcement](#model-host-enforcement) |
 | `401 Token expired` | Set `LITELLM_API_KEY_HELPER`. |
 | No models with gcloud auth | Verify `gcloud auth application-default login` has been run or set `GOOGLE_APPLICATION_CREDENTIALS` to an `authorized_user` ADC file |
 | Enterprise SSO waits for token insertion | The proxy returned 404/405 for `/sso/cli/start`, so Pi used the legacy flow — upgrade LiteLLM or paste the UI token |

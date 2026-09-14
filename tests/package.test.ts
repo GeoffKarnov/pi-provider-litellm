@@ -243,7 +243,7 @@ describe("pi package compatibility", () => {
                 name: cachedModelId,
                 provider: "litellm",
                 api: "openai-completions",
-                baseUrl: "https://litellm.example.com/v1",
+                baseUrl: "https://proxy.invalid/v1",
                 reasoning: false,
                 input: ["text"],
                 cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
@@ -277,17 +277,24 @@ describe("pi package compatibility", () => {
     const sourceDir = join(repoRoot, "src");
     const sourceFiles = (await readdir(sourceDir, { recursive: true })).filter((file) => file.endsWith(".ts"));
     const imports = await Promise.all(
-      sourceFiles.map(
-        async (file) => [file, importSpecifiers(await readFile(join(sourceDir, file), "utf8"), file)] as const,
-      ),
+      sourceFiles.map(async (file) => {
+        const source = await readFile(join(sourceDir, file), "utf8");
+        return [file, source, importSpecifiers(source, file)] as const;
+      }),
     );
 
-    // A scanner bug that returned nothing would make the allowlist vacuously true, so
-    // require every shipped module to yield at least one specifier. The oracle itself is
-    // pinned by tests/import-specifiers.test.ts.
+    // A scanner bug that returned nothing would make the allowlist vacuously true. Pure helper
+    // modules may genuinely have no imports (checked below file by file, not just in aggregate,
+    // so a scanner regression isolated to one file with real imports cannot hide behind another
+    // file's non-empty result). The oracle itself is pinned by tests/import-specifiers.test.ts.
     expect(sourceFiles.length).toBeGreaterThan(0);
-    for (const [file, specifiers] of imports) {
-      expect(specifiers.length, `${file}: no module specifiers found`).toBeGreaterThan(0);
+    for (const [file, source, specifiers] of imports) {
+      if (/\bimport\b/.test(source)) {
+        expect(
+          specifiers.length,
+          `${file}: source contains "import" but the scanner found no specifiers`,
+        ).toBeGreaterThan(0);
+      }
     }
 
     const allowed = new Set([
@@ -296,7 +303,7 @@ describe("pi package compatibility", () => {
       "@earendil-works/pi-ai/providers/all",
       "@earendil-works/pi-coding-agent",
     ]);
-    for (const [file, specifiers] of imports) {
+    for (const [file, , specifiers] of imports) {
       for (const specifier of specifiers) {
         // UNVERIFIABLE_SPECIFIER and FORBIDDEN_RESOLVER land here too: a computed `import()`
         // cannot be shown to resolve to something the loader provides, and a CommonJS or
@@ -338,6 +345,12 @@ describe("pi package compatibility", () => {
     expect(readme).toContain("Opening `/model` refreshes configured provider catalogs");
     expect(readme).not.toContain("/litellm-refresh");
     expect(readme).toContain("Legacy `litellm-models*.json` files are ignored and are not deleted");
+    expect(readme).toContain("### Model host enforcement");
+    expect(readme).toContain("native `Provider` contract has no separate protocol-capability declaration");
+    expect(readme).toContain("resolved auth carries `baseUrl` set to the credential's proxy root");
+    expect(readme).toContain(
+      "Responses transport has a different compatibility type and uses native `prompt_cache_key`",
+    );
     expect(readme).not.toContain("older than 24 hours");
     expect(readme).not.toContain("enter `2` for SSO");
   });

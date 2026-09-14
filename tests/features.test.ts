@@ -34,7 +34,7 @@ async function refreshProvider(pi: TestPi, allowNetwork = true, signal?: AbortSi
     credential: {
       type: "api_key",
       key: process.env.LITELLM_API_KEY ?? "sk-test",
-      env: { LITELLM_BASE_URL: process.env.LITELLM_BASE_URL ?? "https://litellm.example.com" },
+      env: { LITELLM_BASE_URL: process.env.LITELLM_BASE_URL ?? "https://proxy.example.com" },
     },
     signal: signal ?? new AbortController().signal,
   });
@@ -109,7 +109,7 @@ async function setupAdcProvider(adc: unknown | undefined): Promise<{
   const adcPath = join(agentDir, "adc.json");
   if (adc !== undefined) await writeFile(adcPath, JSON.stringify(adc), "utf8");
   process.env.GOOGLE_APPLICATION_CREDENTIALS = adcPath;
-  process.env.LITELLM_BASE_URL = "https://litellm.example.com";
+  process.env.LITELLM_BASE_URL = "https://proxy.example.com";
   process.env.LITELLM_GCLOUD_TOKEN_AUTH = "1";
   process.env.LITELLM_DISCOVERY_TIMEOUT_MS = "0";
 
@@ -214,7 +214,7 @@ const named = (base: string) => expect.stringMatching(new RegExp(`^${base}_[a-f0
 describe("feature parity", () => {
   it("registers discovered LiteLLM MCP tools as Pi tools", async () => {
     const agentDir = await mkdtemp(join(tmpdir(), "pi-provider-litellm-"));
-    process.env.LITELLM_BASE_URL = "https://litellm.example.com";
+    process.env.LITELLM_BASE_URL = "https://proxy.example.com";
     process.env.LITELLM_API_KEY = "sk-test";
 
     vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
@@ -322,11 +322,11 @@ describe("feature parity", () => {
         modelInfoRequests++;
         return modelInfoRequests === 1 ? jsonResponse(200, { data: [] }) : secondModel;
       }
-      if (url === "https://litellm.example.com/mcp-rest/tools/list") return catalog;
+      if (url === "https://proxy.example.com/mcp-rest/tools/list") return catalog;
       throw new Error(`unexpected URL: ${url}`);
     });
 
-    process.env.LITELLM_BASE_URL = "https://litellm.example.com";
+    process.env.LITELLM_BASE_URL = "https://proxy.example.com";
     process.env.LITELLM_API_KEY = "sk-test";
     const extension = await loadExtension(agentDir);
     const pi = createPi();
@@ -337,14 +337,14 @@ describe("feature parity", () => {
 
     const firstRefresh = refreshProvider(pi);
     await vi.waitFor(() =>
-      expect(fetchMock).toHaveBeenCalledWith("https://litellm.example.com/mcp-rest/tools/list", expect.anything()),
+      expect(fetchMock).toHaveBeenCalledWith("https://proxy.example.com/mcp-rest/tools/list", expect.anything()),
     );
     const secondRefresh = refreshProvider(pi);
     await vi.waitFor(() => expect(modelInfoRequests).toBe(2));
     resolveSecondModel(jsonResponse(200, { data: [] }));
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(
-      fetchMock.mock.calls.filter(([url]) => url === "https://litellm.example.com/mcp-rest/tools/list"),
+      fetchMock.mock.calls.filter(([url]) => url === "https://proxy.example.com/mcp-rest/tools/list"),
     ).toHaveLength(1);
     resolveCatalog(jsonResponse(200, []));
     await Promise.all([firstRefresh, secondRefresh]);
@@ -418,11 +418,11 @@ describe("feature parity", () => {
         modelInfoRequests++;
         return jsonResponse(200, { data: [] });
       }
-      if (url === "https://litellm.example.com/mcp-rest/tools/list") return catalog;
+      if (url === "https://proxy.example.com/mcp-rest/tools/list") return catalog;
       throw new Error(`unexpected URL: ${url}`);
     });
 
-    process.env.LITELLM_BASE_URL = "https://litellm.example.com";
+    process.env.LITELLM_BASE_URL = "https://proxy.example.com";
     process.env.LITELLM_API_KEY = "sk-test";
     const extension = await loadExtension(agentDir);
     const pi = createPi();
@@ -432,7 +432,7 @@ describe("feature parity", () => {
     fetchMock.mockClear();
     const firstRefresh = refreshProvider(pi);
     await vi.waitFor(() =>
-      expect(fetchMock).toHaveBeenCalledWith("https://litellm.example.com/mcp-rest/tools/list", expect.anything()),
+      expect(fetchMock).toHaveBeenCalledWith("https://proxy.example.com/mcp-rest/tools/list", expect.anything()),
     );
     const secondRefresh = refreshProvider(pi, true, secondAbort.signal);
     await vi.waitFor(() => expect(modelInfoRequests).toBe(2));
@@ -486,9 +486,9 @@ describe("feature parity", () => {
         getProviderAuth: async () => ({
           auth: {
             apiKey: "fresh-token",
-            baseUrl: "https://fresh.example.com/v1",
             headers: { "x-tenant": "fresh" },
           },
+          env: { LITELLM_BASE_URL: "https://fresh.example.com/v1" },
         }),
         getProvider: () => pi.providers[0],
       },
@@ -526,9 +526,9 @@ describe("feature parity", () => {
         getProviderAuth: async () => ({
           auth: {
             apiKey: "fresh-token",
-            baseUrl: "https://fresh.example.com/v1",
             headers: { "x-tenant": "fresh" },
           },
+          env: { LITELLM_BASE_URL: "https://fresh.example.com/v1" },
         }),
         getProvider: () => pi.providers[0],
       },
@@ -544,7 +544,7 @@ describe("feature parity", () => {
 
   it("injects enabled LiteLLM skills into the system prompt", async () => {
     const agentDir = await mkdtemp(join(tmpdir(), "pi-provider-litellm-"));
-    process.env.LITELLM_BASE_URL = "https://litellm.example.com";
+    process.env.LITELLM_BASE_URL = "https://proxy.example.com";
     process.env.LITELLM_API_KEY = "sk-test";
 
     vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
@@ -570,7 +570,8 @@ describe("feature parity", () => {
       {
         modelRegistry: {
           getProviderAuth: async () => ({
-            auth: { apiKey: "sk-test", baseUrl: "https://litellm.example.com/v1" },
+            auth: { apiKey: "sk-test" },
+            env: { LITELLM_BASE_URL: "https://skills.example.com/v1" },
           }),
           getProvider: () => pi.providers[0],
         },
@@ -595,7 +596,8 @@ describe("feature parity", () => {
       {
         modelRegistry: {
           getProviderAuth: async () => ({
-            auth: { apiKey: "active-key", baseUrl: "https://active.example.com/v1" },
+            auth: { apiKey: "active-key" },
+            env: { LITELLM_BASE_URL: "https://active.example.com/v1" },
           }),
           getProvider: () => pi.providers[0],
         },
@@ -626,7 +628,7 @@ describe("feature parity", () => {
       JSON.stringify({ litellm: { skills: { enabled: false } } }),
       "utf8",
     );
-    process.env.LITELLM_BASE_URL = "https://litellm.example.com";
+    process.env.LITELLM_BASE_URL = "https://proxy.example.com";
     process.env.LITELLM_API_KEY = "sk-test";
     const requestedUrls: string[] = [];
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
@@ -649,7 +651,7 @@ describe("feature parity", () => {
   it("disables LiteLLM MCP discovery through settings", async () => {
     const agentDir = await mkdtemp(join(tmpdir(), "pi-provider-litellm-"));
     await writeFile(join(agentDir, "settings.json"), JSON.stringify({ litellm: { mcp: { enabled: false } } }), "utf8");
-    process.env.LITELLM_BASE_URL = "https://litellm.example.com";
+    process.env.LITELLM_BASE_URL = "https://proxy.example.com";
     process.env.LITELLM_API_KEY = "sk-test";
 
     const requestedUrls: string[] = [];
@@ -666,14 +668,14 @@ describe("feature parity", () => {
     await refreshProvider(pi);
 
     // Activation seeds the catalog, then the refresh discovers again; neither may touch MCP.
-    expect(new Set(requestedUrls)).toEqual(new Set(["https://litellm.example.com/model/info"]));
+    expect(new Set(requestedUrls)).toEqual(new Set(["https://proxy.example.com/model/info"]));
     expect(pi.tools.map((tool) => tool.name)).toContain("litellm_skill_list");
     expect(pi.tools.some((tool) => tool.name.startsWith("mcp_"))).toBe(false);
   });
 
   it("registers cost tracking and session grouping handlers", async () => {
     const agentDir = await mkdtemp(join(tmpdir(), "pi-provider-litellm-"));
-    process.env.LITELLM_BASE_URL = "https://litellm.example.com";
+    process.env.LITELLM_BASE_URL = "https://proxy.example.com";
     process.env.LITELLM_API_KEY = "sk-test";
 
     vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
@@ -853,7 +855,7 @@ describe("feature parity", () => {
 
   it("does not send thinking for Kimi OpenAI completions requests", async () => {
     const agentDir = await mkdtemp(join(tmpdir(), "pi-provider-litellm-"));
-    process.env.LITELLM_BASE_URL = "https://litellm.example.com";
+    process.env.LITELLM_BASE_URL = "https://proxy.example.com";
     process.env.LITELLM_API_KEY = "sk-test";
 
     vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
@@ -891,7 +893,7 @@ describe("feature parity", () => {
 
   it("keeps Moonshot suppression off routes that only look like Kimi", async () => {
     const agentDir = await mkdtemp(join(tmpdir(), "pi-provider-litellm-"));
-    process.env.LITELLM_BASE_URL = "https://litellm.example.com";
+    process.env.LITELLM_BASE_URL = "https://proxy.example.com";
     process.env.LITELLM_API_KEY = "sk-test";
 
     vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
@@ -930,7 +932,7 @@ describe("feature parity", () => {
 
   it("does not suppress reasoning for forced public or backend discovered models", async () => {
     const agentDir = await mkdtemp(join(tmpdir(), "pi-provider-litellm-"));
-    process.env.LITELLM_BASE_URL = "https://litellm.example.com";
+    process.env.LITELLM_BASE_URL = "https://proxy.example.com";
     process.env.LITELLM_API_KEY = "sk-test";
 
     vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
@@ -967,9 +969,39 @@ describe("feature parity", () => {
     }
   });
 
+  it("leaves payloads for an unregistered API unchanged", async () => {
+    const agentDir = await mkdtemp(join(tmpdir(), "pi-provider-litellm-"));
+    process.env.LITELLM_BASE_URL = "https://proxy.example.com";
+    process.env.LITELLM_API_KEY = "sk-test";
+
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse(200, { data: [] }));
+
+    const extension = await loadExtension(agentDir);
+    const pi = createPi();
+    await extension(pi);
+
+    const payload = {
+      messages: [{ role: "user", content: "hi" }],
+      reasoning_effort: "HIGH",
+      thinking: { type: "enabled", budget_tokens: 1024 },
+    };
+    const beforeRequest = pi.handlers.get("before_provider_request")?.[0];
+    const updated = beforeRequest?.(
+      { payload },
+      { model: { provider: "litellm", id: "kimi-k2.6", api: "anthropic-messages" } },
+    );
+
+    expect(updated).toBeUndefined();
+    expect(payload).toEqual({
+      messages: [{ role: "user", content: "hi" }],
+      reasoning_effort: "HIGH",
+      thinking: { type: "enabled", budget_tokens: 1024 },
+    });
+  });
+
   it("leaves Kimi Responses requests unchanged", async () => {
     const agentDir = await mkdtemp(join(tmpdir(), "pi-provider-litellm-"));
-    process.env.LITELLM_BASE_URL = "https://litellm.example.com";
+    process.env.LITELLM_BASE_URL = "https://proxy.example.com";
     process.env.LITELLM_API_KEY = "sk-test";
 
     vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse(200, { data: [] }));
@@ -989,7 +1021,7 @@ describe("feature parity", () => {
 
   it("fills empty assistant content on Kimi tool calls", async () => {
     const agentDir = await mkdtemp(join(tmpdir(), "pi-provider-litellm-"));
-    process.env.LITELLM_BASE_URL = "https://litellm.example.com";
+    process.env.LITELLM_BASE_URL = "https://proxy.example.com";
     process.env.LITELLM_API_KEY = "sk-test";
 
     vi.spyOn(globalThis, "fetch").mockResolvedValue(
@@ -1044,7 +1076,7 @@ describe("feature parity", () => {
 
   it("preserves image blocks after Kimi tool results", async () => {
     const agentDir = await mkdtemp(join(tmpdir(), "pi-provider-litellm-"));
-    process.env.LITELLM_BASE_URL = "https://litellm.example.com";
+    process.env.LITELLM_BASE_URL = "https://proxy.example.com";
     process.env.LITELLM_API_KEY = "sk-test";
 
     vi.spyOn(globalThis, "fetch").mockResolvedValue(
@@ -1106,7 +1138,7 @@ describe("feature parity", () => {
 
   it("leaves well-formed Kimi tool messages untouched", async () => {
     const agentDir = await mkdtemp(join(tmpdir(), "pi-provider-litellm-"));
-    process.env.LITELLM_BASE_URL = "https://litellm.example.com";
+    process.env.LITELLM_BASE_URL = "https://proxy.example.com";
     process.env.LITELLM_API_KEY = "sk-test";
 
     vi.spyOn(globalThis, "fetch").mockResolvedValue(
@@ -1144,7 +1176,7 @@ describe("feature parity", () => {
 
   it("leaves strict-schema tool messages untouched for non-Moonshot models", async () => {
     const agentDir = await mkdtemp(join(tmpdir(), "pi-provider-litellm-"));
-    process.env.LITELLM_BASE_URL = "https://litellm.example.com";
+    process.env.LITELLM_BASE_URL = "https://proxy.example.com";
     process.env.LITELLM_API_KEY = "sk-test";
 
     vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse(200, { data: [] }));
@@ -1175,7 +1207,7 @@ describe("feature parity", () => {
 
   it("drops reasoning fields for llm-gateway/gpt-5.5 tool requests", async () => {
     const agentDir = await mkdtemp(join(tmpdir(), "pi-provider-litellm-"));
-    process.env.LITELLM_BASE_URL = "https://litellm.example.com";
+    process.env.LITELLM_BASE_URL = "https://proxy.example.com";
     process.env.LITELLM_API_KEY = "sk-test";
 
     vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
@@ -1226,7 +1258,7 @@ describe("feature parity", () => {
 
   it("leaves gpt-5.5 tool requests without reasoning fields unchanged", async () => {
     const agentDir = await mkdtemp(join(tmpdir(), "pi-provider-litellm-"));
-    process.env.LITELLM_BASE_URL = "https://litellm.example.com";
+    process.env.LITELLM_BASE_URL = "https://proxy.example.com";
     process.env.LITELLM_API_KEY = "sk-test";
 
     vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
@@ -1264,7 +1296,7 @@ describe("feature parity", () => {
 
   it("keeps reasoning fields for gpt-5.5 Responses tool requests", async () => {
     const agentDir = await mkdtemp(join(tmpdir(), "pi-provider-litellm-"));
-    process.env.LITELLM_BASE_URL = "https://litellm.example.com";
+    process.env.LITELLM_BASE_URL = "https://proxy.example.com";
     process.env.LITELLM_API_KEY = "sk-test";
 
     vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse(200, { data: [] }));
@@ -1291,7 +1323,7 @@ describe("feature parity", () => {
 
   it("drops reasoning fields for gpt-5.5 route aliases", async () => {
     const agentDir = await mkdtemp(join(tmpdir(), "pi-provider-litellm-"));
-    process.env.LITELLM_BASE_URL = "https://litellm.example.com";
+    process.env.LITELLM_BASE_URL = "https://proxy.example.com";
     process.env.LITELLM_API_KEY = "sk-test";
 
     vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
@@ -1334,7 +1366,7 @@ describe("feature parity", () => {
 
   it("normalizes capitalized reasoning effort values for Gemini models only", async () => {
     const agentDir = await mkdtemp(join(tmpdir(), "pi-provider-litellm-"));
-    process.env.LITELLM_BASE_URL = "https://litellm.example.com";
+    process.env.LITELLM_BASE_URL = "https://proxy.example.com";
     process.env.LITELLM_API_KEY = "sk-test";
 
     vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse(200, { data: [] }));
@@ -1377,7 +1409,7 @@ describe("feature parity", () => {
 
   it("normalizes Kimi think tags into Pi thinking blocks", async () => {
     const agentDir = await mkdtemp(join(tmpdir(), "pi-provider-litellm-"));
-    process.env.LITELLM_BASE_URL = "https://litellm.example.com";
+    process.env.LITELLM_BASE_URL = "https://proxy.example.com";
     process.env.LITELLM_API_KEY = "sk-test";
 
     vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
@@ -1418,9 +1450,62 @@ describe("feature parity", () => {
     ]);
   });
 
+  it("normalizes think tags for opaque aliases whose requests merge Moonshot reasoning", async () => {
+    const agentDir = await mkdtemp(join(tmpdir(), "pi-provider-litellm-"));
+    process.env.LITELLM_BASE_URL = "https://proxy.example.com";
+    process.env.LITELLM_API_KEY = "sk-test";
+
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = String(input);
+      if (url.endsWith("/model/info")) {
+        return jsonResponse(200, {
+          data: [
+            {
+              model_name: "k3-prod",
+              litellm_params: { model: "moonshot/kimi-k2.5" },
+              model_info: { mode: "chat" },
+            },
+          ],
+        });
+      }
+      throw new Error(`unexpected URL: ${url}`);
+    });
+
+    const extension = await loadExtension(agentDir);
+    const pi = createPi();
+    await extension(pi);
+    await refreshProvider(pi);
+    const model = pi.providers[0]?.getModels().find((candidate) => candidate.id === "k3-prod");
+    expect(model).toMatchObject({ suppressReasoningContent: true });
+
+    let message: any = {
+      role: "assistant",
+      provider: "litellm",
+      model: "k3-prod",
+      content: [{ type: "text", text: "<think>internal reasoning</think>DONE" }],
+      usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 },
+    };
+    for (const handler of pi.handlers.get("message_end") ?? []) {
+      const result = await handler(
+        { message },
+        {
+          modelRegistry: {
+            find: (provider: string, id: string) => (provider === "litellm" && id === "k3-prod" ? model : undefined),
+          },
+        },
+      );
+      if (result?.message) message = result.message;
+    }
+
+    expect(message.content).toEqual([
+      { type: "thinking", thinking: "internal reasoning" },
+      { type: "text", text: "DONE" },
+    ]);
+  });
+
   it("keeps final Kimi text visible when a dangling think tag prefixes it", async () => {
     const agentDir = await mkdtemp(join(tmpdir(), "pi-provider-litellm-"));
-    process.env.LITELLM_BASE_URL = "https://litellm.example.com";
+    process.env.LITELLM_BASE_URL = "https://proxy.example.com";
     process.env.LITELLM_API_KEY = "sk-test";
 
     vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
@@ -1459,7 +1544,7 @@ describe("feature parity", () => {
 
   it("overrides assistant cost from LiteLLM response metadata", async () => {
     const agentDir = await mkdtemp(join(tmpdir(), "pi-provider-litellm-"));
-    process.env.LITELLM_BASE_URL = "https://litellm.example.com";
+    process.env.LITELLM_BASE_URL = "https://proxy.example.com";
     process.env.LITELLM_API_KEY = "sk-test";
 
     vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
@@ -1516,7 +1601,7 @@ describe("feature parity", () => {
 
   it("does not apply LiteLLM model costs to other providers' messages", async () => {
     const agentDir = await mkdtemp(join(tmpdir(), "pi-provider-litellm-"));
-    process.env.LITELLM_BASE_URL = "https://litellm.example.com";
+    process.env.LITELLM_BASE_URL = "https://proxy.example.com";
     process.env.LITELLM_API_KEY = "sk-test";
 
     vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
@@ -1559,7 +1644,7 @@ describe("feature parity", () => {
 
   it("ignores LiteLLM cost headers captured from non-LiteLLM responses", async () => {
     const agentDir = await mkdtemp(join(tmpdir(), "pi-provider-litellm-"));
-    process.env.LITELLM_BASE_URL = "https://litellm.example.com";
+    process.env.LITELLM_BASE_URL = "https://proxy.example.com";
     process.env.LITELLM_API_KEY = "sk-test";
 
     vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
