@@ -1,6 +1,7 @@
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { getSupportedThinkingLevels } from "@earendil-works/pi-ai";
 import { getModel } from "@earendil-works/pi-ai/compat";
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -5745,5 +5746,379 @@ describe("discoverModels timeout", () => {
     const start = Date.now();
     await expect(discoverModels("https://litellm.example.com", "sk-test", { timeoutMs: 30 })).rejects.toBeDefined();
     expect(Date.now() - start).toBeLessThan(500);
+  });
+});
+
+describe("native Messages discovery", () => {
+  it.each([
+    { flags: [null], low: true, max: true },
+    { flags: [true, undefined], low: true, max: false },
+    { flags: [true, null], low: true, max: false },
+    { flags: [null, undefined], low: true, max: true },
+    { flags: [false, undefined], low: false, max: false },
+    { flags: [true, true], low: true, max: true },
+  ])("treats native reasoning flags $flags as boolean evidence", async ({ flags, low, max }) => {
+    mockEndpoints({
+      "/model/info": () =>
+        jsonResponse(200, {
+          data: flags.map((flag, index) => ({
+            model_name: "native-flag-evidence",
+            litellm_params: { model: "anthropic/claude-sonnet-4-6" },
+            model_info: {
+              id: String(index),
+              mode: "chat",
+              litellm_provider: "anthropic",
+              supports_low_reasoning_effort: flag,
+              supports_max_reasoning_effort: flag,
+            },
+          })),
+        }),
+    });
+    const result = await discoverModels("https://litellm.example.com", "sk-test", { modelsDev: false });
+    const model = { ...result.models[0]!, provider: "litellm", baseUrl: "https://proxy.example.com" };
+    expect(model.api).toBe("anthropic-messages");
+    const levels = getSupportedThinkingLevels(model);
+    expect(levels.includes("low")).toBe(low);
+    expect(levels.includes("max")).toBe(max);
+  });
+
+  it.each(["claude-sonnet-4-6", "claude-opus-4-5"])(
+    "honors denied default native reasoning levels for %s",
+    async (backend) => {
+      mockEndpoints({
+        "/model/info": () =>
+          jsonResponse(200, {
+            data: [
+              {
+                model_name: "native-levels",
+                litellm_params: { model: `anthropic/${backend}` },
+                model_info: {
+                  mode: "chat",
+                  litellm_provider: "anthropic",
+                  supports_none_reasoning_effort: false,
+                  supports_low_reasoning_effort: false,
+                },
+              },
+            ],
+          }),
+      });
+      const result = await discoverModels("https://litellm.example.com", "sk-test", { modelsDev: false });
+      const model = { ...result.models[0]!, provider: "litellm", baseUrl: "https://proxy.example.com" };
+      expect(model.api).toBe("anthropic-messages");
+      expect(getSupportedThinkingLevels(model)).not.toContain("off");
+      expect(getSupportedThinkingLevels(model)).not.toContain("low");
+      expect(getSupportedThinkingLevels(model)).toContain("medium");
+    },
+  );
+
+  it("retains native reasoning denials across different Claude generations", async () => {
+    mockEndpoints({
+      "/model/info": () =>
+        jsonResponse(200, {
+          data: ["claude-sonnet-4-6", "claude-fable-5"].map((backend) => ({
+            model_name: "mixed-native-levels",
+            litellm_params: { model: `anthropic/${backend}` },
+            model_info: { id: backend, mode: "chat", litellm_provider: "anthropic", supports_reasoning: true },
+          })),
+        }),
+    });
+    const result = await discoverModels("https://litellm.example.com", "sk-test", { modelsDev: false });
+    const model = { ...result.models[0]!, provider: "litellm", baseUrl: "https://proxy.example.com" };
+    expect(model.api).toBe("anthropic-messages");
+    expect(getSupportedThinkingLevels(model)).not.toContain("off");
+    expect(getSupportedThinkingLevels(model)).toContain("high");
+  });
+
+  it("uses Anthropic catalog metadata and Messages for the standard Vertex Claude adapter", async () => {
+    mockEndpoints({
+      "/model/info": () =>
+        jsonResponse(200, {
+          data: [
+            {
+              model_name: "vertex-claude",
+              litellm_params: { model: "vertex_ai/claude-opus-4-5" },
+              model_info: { mode: "chat", litellm_provider: "vertex_ai-anthropic_models" },
+            },
+          ],
+        }),
+    });
+
+    const result = await discoverModels("https://litellm.example.com", "sk-test", { modelsDev: false });
+
+    expect(result.models).toEqual([
+      expect.objectContaining({
+        id: "vertex-claude",
+        name: "vertex-claude",
+        reasoning: true,
+        contextWindow: 200_000,
+        maxTokens: 64_000,
+        cost: { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 },
+        api: "anthropic-messages",
+      }),
+    ]);
+  });
+
+  it("uses Anthropic catalog metadata and Messages for the vertex_ai adapter alias", async () => {
+    mockEndpoints({
+      "/model/info": () =>
+        jsonResponse(200, {
+          data: [
+            {
+              model_name: "vertex-claude",
+              litellm_params: { model: "vertex_ai/claude-opus-4-5" },
+              model_info: { mode: "chat", litellm_provider: "vertex_ai" },
+            },
+          ],
+        }),
+    });
+
+    const result = await discoverModels("https://litellm.example.com", "sk-test", { modelsDev: false });
+
+    expect(result.models[0]).toMatchObject({
+      id: "vertex-claude",
+      name: "vertex-claude",
+      reasoning: true,
+      contextWindow: 200_000,
+      maxTokens: 64_000,
+      cost: { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 },
+      api: "anthropic-messages",
+    });
+  });
+
+  it("withholds native Messages when the Vertex Anthropic adapter conflicts with the routed provider", () => {
+    const resolved = resolveModelInfoCatalog({
+      model_name: "contradictory-adapter",
+      litellm_params: { model: "openai/gpt-4o" },
+      model_info: { mode: "chat", litellm_provider: "vertex_ai-anthropic_models" },
+    });
+
+    expect(resolved).not.toHaveProperty("messagesCompat");
+  });
+
+  it("withholds native Messages when a recognized adapter conflicts with the routed provider", () => {
+    const resolved = resolveModelInfoCatalog({
+      model_name: "contradictory-adapter",
+      litellm_params: { model: "anthropic/claude-sonnet-4-6" },
+      model_info: { mode: "chat", litellm_provider: "openai" },
+    });
+
+    expect(resolved).not.toHaveProperty("messagesCompat");
+  });
+
+  it("withholds native Messages policy for conflicting Claude generations", () => {
+    const resolved = resolveModelInfoCatalog({
+      model_name: "contradictory-claude-generations",
+      litellm_params: { model: "anthropic/claude-opus-4-7" },
+      model_info: {
+        mode: "chat",
+        litellm_provider: "anthropic",
+        base_model: "anthropic/claude-opus-4-5",
+      },
+    });
+
+    expect(resolved).not.toHaveProperty("messagesCompat");
+  });
+
+  it("withholds native Messages when any declared Claude backend lacks a compatible policy", () => {
+    const resolved = resolveModelInfoCatalog({
+      model_name: "partially-resolved-claude-generations",
+      litellm_params: { model: "anthropic/claude-opus-4-7" },
+      model_info: {
+        mode: "chat",
+        litellm_provider: "anthropic",
+        base_model: "anthropic/claude-future-9-9",
+      },
+    });
+
+    expect(resolved).toMatchObject({ provider: "anthropic", catalogModelId: "anthropic/claude-future-9-9" });
+    expect(resolved).not.toHaveProperty("cost");
+    expect(resolved).not.toHaveProperty("reasoning");
+    expect(resolved).not.toHaveProperty("contextWindow");
+    expect(resolved).not.toHaveProperty("maxTokens");
+    expect(resolved).not.toHaveProperty("messagesCompat");
+  });
+
+  it("downgrades health-derived Messages when an unreadable detail name uses the route fallback", async () => {
+    mockEndpoints({
+      "/model/info": () => jsonResponse(404, {}),
+      "/v1/models": () => jsonResponse(404, {}),
+      "/health": () => jsonResponse(200, { healthy_endpoints: [{ model: "team-claude", model_id: "messages-uuid" }] }),
+      "/model/info?litellm_model_id=messages-uuid": () =>
+        jsonResponse(200, {
+          data: [
+            {
+              model_name: 7,
+              model_info: { mode: "chat", litellm_provider: "anthropic" },
+              litellm_params: { model: "anthropic/claude-opus-5" },
+            },
+          ],
+        }),
+    });
+
+    const result = await discoverModels("https://litellm.example.com", "sk-test", { modelsDev: false });
+
+    expect(result.models).toEqual([
+      expect.objectContaining({
+        id: "team-claude",
+        api: "openai-completions",
+        compat: {
+          supportsStore: false,
+          supportsReasoningEffort: false,
+          cacheControlFormat: "anthropic",
+        },
+      }),
+    ]);
+  });
+
+  it("rechecks Chat reasoning levels when health discovery downgrades Messages", async () => {
+    mockEndpoints({
+      "/model/info": () => jsonResponse(404, {}),
+      "/v1/models": () => jsonResponse(404, {}),
+      "/health": () => jsonResponse(200, { healthy_endpoints: [{ model: "claude-route", model_id: "claude-id" }] }),
+      "/model/info?litellm_model_id=claude-id": () =>
+        jsonResponse(200, {
+          data: [
+            {
+              model_name: "claude-route",
+              litellm_params: { model: "anthropic/claude-opus-5" },
+              model_info: {
+                mode: "chat",
+                litellm_provider: "anthropic",
+                supports_reasoning: true,
+                supports_low_reasoning_effort: true,
+                supported_openai_params: ["reasoning_effort"],
+              },
+            },
+          ],
+        }),
+    });
+    const result = await discoverModels("https://litellm.example.com", "sk-test", { modelsDev: false });
+    const model = { ...result.models[0]!, provider: "litellm", baseUrl: "https://proxy.example.com/v1" };
+    expect(model).toMatchObject({ api: "openai-completions", compat: { supportsReasoningEffort: true } });
+    const levels = getSupportedThinkingLevels(model);
+    expect(levels).toContain("low");
+    expect(levels).not.toContain("xhigh");
+    expect(levels).not.toContain("max");
+  });
+
+  it("never selects native Messages from /health, even with complete matching detail", async () => {
+    mockEndpoints({
+      "/model/info?litellm_model_id=uuid-claude": () =>
+        jsonResponse(200, {
+          data: [
+            {
+              model_name: "claude-route",
+              model_info: {
+                id: "uuid-claude",
+                mode: "chat",
+                litellm_provider: "anthropic",
+                supports_reasoning: true,
+                supports_high_reasoning_effort: true,
+              },
+              litellm_params: { model: "anthropic/claude-sonnet-4-6" },
+            },
+          ],
+        }),
+      "/model/info": () => jsonResponse(404, {}),
+      "/v1/models": () => jsonResponse(404, {}),
+      "/health": () => jsonResponse(200, { healthy_endpoints: [{ model: "claude-route", model_id: "uuid-claude" }] }),
+    });
+
+    const result = await discoverModels("https://litellm.example.com", "sk-test", { modelsDev: false });
+
+    expect(result.source).toBe("health");
+    expect(result.models[0]).toMatchObject({
+      id: "claude-route",
+      api: "openai-completions",
+      compat: {
+        supportsStore: false,
+        cacheControlFormat: "anthropic",
+      },
+      thinkingLevelMap: {
+        off: null,
+        minimal: null,
+        low: null,
+        medium: null,
+        high: null,
+        xhigh: null,
+        max: null,
+      },
+    });
+    expect(
+      getSupportedThinkingLevels({
+        ...result.models[0]!,
+        provider: "litellm",
+        baseUrl: "https://proxy.example.com/v1",
+      }),
+    ).toEqual([]);
+  });
+
+  it("uses Claude base_model evidence when every declared adapter target resolves the same policy", () => {
+    expect(
+      resolveModelInfoCatalog({
+        model_name: "qualified-route",
+        litellm_params: { model: "bedrock/us.anthropic.claude-sonnet-4-6-v1:0" },
+        model_info: {
+          mode: "chat",
+          litellm_provider: "bedrock",
+          base_model: "bedrock/us.anthropic.claude-sonnet-4-6-v1:0",
+        },
+      }),
+    ).toMatchObject({ messagesCompat: expect.anything() });
+  });
+});
+
+describe("Moonshot transport suppression", () => {
+  it.each([
+    [
+      "Azure-hosted Kimi",
+      {
+        model_name: "kimi-k3",
+        litellm_params: { model: "azure/FW-Kimi-K3" },
+        model_info: {
+          mode: "chat",
+          base_model: "fireworks/accounts/fireworks/models/kimi-k3",
+          litellm_provider: "azure",
+        },
+      },
+      false,
+    ],
+    [
+      "Bedrock-hosted Kimi",
+      {
+        model_name: "moonshotai-kimi-k2-5",
+        litellm_params: { model: "bedrock/moonshotai.kimi-k2.5" },
+        model_info: {
+          mode: "chat",
+          base_model: "moonshotai.kimi-k2.5",
+          litellm_provider: "bedrock_converse",
+        },
+      },
+      false,
+    ],
+    [
+      "opaque Moonshot route",
+      {
+        model_name: "k3-prod",
+        litellm_params: { model: "moonshot/kimi-k2.5" },
+        model_info: { mode: "chat" },
+      },
+      true,
+    ],
+    [
+      "conflicting Moonshot provider and Azure backend",
+      {
+        model_name: "kimi-prod",
+        litellm_params: { custom_llm_provider: "moonshot", model: "azure_ai/FW-Kimi-K3" },
+        model_info: { mode: "chat" },
+      },
+      false,
+    ],
+  ] as const)("keeps request-side reasoning suppression transport-scoped for %s", async (_name, entry, suppress) => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse(200, { data: [entry] }));
+
+    const result = await discoverModels("https://litellm.example.com", "sk-test", { modelsDev: false });
+
+    expect(result.models[0]?.litellmPolicy?.suppressReasoningVisibility === true).toBe(suppress);
   });
 });

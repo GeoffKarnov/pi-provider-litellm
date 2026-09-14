@@ -45,10 +45,11 @@ function harness(options: { configuredModels: ReturnType<typeof model>[]; discov
   const wire: WireRequest[] = [];
   const payloads: unknown[] = [];
   vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
-    const headers = new Headers(init?.headers);
+    const request = input instanceof Request ? input : undefined;
+    const headers = new Headers(request?.headers ?? init?.headers);
     wire.push({
-      url: String(input),
-      authorization: headers.get("authorization"),
+      url: request?.url ?? String(input),
+      authorization: headers.get("authorization") ?? headers.get("x-api-key"),
       tenant: headers.get("x-tenant"),
     });
     if (typeof init?.body === "string") payloads.push(JSON.parse(init.body));
@@ -135,6 +136,22 @@ describe("dispatch routing through Pi's provider composer", () => {
     await models.complete(entry, { messages: [] });
 
     expect(wire.map((request) => request.url)).toEqual([`${CREDENTIAL_ROOT}/v1/responses`]);
+    assertNoForeignCredential(wire);
+  });
+
+  it.each([false, true])("pins a foreign-host Messages model with catalog support %s", async (catalogSupport) => {
+    const entry = model("configured-messages", "anthropic-messages", FOREIGN_ROOT);
+    const { wire, models } = harness({
+      configuredModels: [entry],
+      discoveredApis: catalogSupport ? ["openai-completions", "anthropic-messages"] : ["openai-completions"],
+    });
+
+    // The mock speaks Chat SSE; only the request destination and credentials matter here.
+    await models.complete(entry, { messages: [] });
+
+    expect(wire.map((request) => request.url)).toEqual([`${CREDENTIAL_ROOT}/v1/messages`]);
+    expect([CANARY_CREDENTIAL, `Bearer ${CANARY_CREDENTIAL}`]).toContain(wire[0]?.authorization);
+    expect(wire[0]?.tenant).toBe("canary-tenant");
     assertNoForeignCredential(wire);
   });
 

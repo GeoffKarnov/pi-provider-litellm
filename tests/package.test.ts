@@ -321,8 +321,8 @@ describe("pi package compatibility", () => {
       with: { type: "json" },
     });
 
-    expect(manifest.peerDependencies["@earendil-works/pi-ai"]).toBe(">=0.81.0");
-    expect(manifest.peerDependencies["@earendil-works/pi-coding-agent"]).toBe(">=0.81.0");
+    expect(manifest.peerDependencies["@earendil-works/pi-ai"]).toBe(">=0.83.0");
+    expect(manifest.peerDependencies["@earendil-works/pi-coding-agent"]).toBe(">=0.83.0");
     expect(manifest.peerDependenciesMeta).toEqual({
       "@earendil-works/pi-ai": { optional: true },
       "@earendil-works/pi-coding-agent": { optional: true },
@@ -335,14 +335,22 @@ describe("pi package compatibility", () => {
   it("documents native Provider model persistence and the extension-only package surface", async () => {
     const readme = await readFile(join(repoRoot, "README.md"), "utf8");
 
-    expect(readme).toContain("Pi 0.81.0+ is required");
-    expect(readme).toMatch(/source\s+entrypoint has been smoke-tested with Pi 0\.81\.0/);
+    expect(readme).toContain("Pi 0.83.0+ is required");
+    expect(readme).not.toContain("smoke-tested with Pi 0.81.0");
     expect(readme).toMatch(/no\s+longer exposes that library import/);
     expect(readme).toContain("native Provider");
     expect(readme).toContain("run `/login`, choose `Sign in with an API key`, then choose `LiteLLM API key`");
     expect(readme).toContain("With `/login litellm`, choose `Sign in with an API key` directly");
     expect(readme).toContain("~/.pi/agent/models-store.json");
     expect(readme).toContain("Opening `/model` refreshes configured provider catalogs");
+    expect(readme).toContain("### Model host enforcement");
+    expect(readme).toContain(
+      "Pi uses its global API implementation instead, bypassing this extension's dispatch-time host guard",
+    );
+    expect(readme).toContain("Path prefixes are part of the root and remain case-sensitive");
+    expect(readme).toContain("Different concrete catalog models conflict even within one provider");
+    expect(readme).toContain("An unresolved routing or base-model identity denies native Messages");
+    expect(readme).toContain("conflicts with a provider-qualified model ID instead receives ` (incomplete metadata)`");
     expect(readme).not.toContain("/litellm-refresh");
     expect(readme).toContain("### Model host enforcement");
     expect(readme).toContain("native `Provider` contract has no separate protocol-capability declaration");

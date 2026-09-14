@@ -11,6 +11,7 @@ import {
   DEFAULT_CONTEXT_WINDOW,
   DEFAULT_MAX_TOKENS,
   hasMixedIncompatibleDeploymentModes,
+  type MessagesBackendCompat,
   meetVendorCompat,
   normalizedMode,
   reduceModelGroup,
@@ -215,7 +216,12 @@ export function enrichCachedModel(input: Model<Api>): Model<Api> {
   const model = {
     ...restoredWithoutLevels,
     ...closeSerializerPolicy({
-      api: restored.api === "openai-responses" ? "openai-responses" : "openai-completions",
+      api:
+        restored.api === "anthropic-messages"
+          ? "anthropic-messages"
+          : restored.api === "openai-responses"
+            ? "openai-responses"
+            : "openai-completions",
       reasoning: restored.reasoning,
       vendorCompat: restored.compat,
       catalogLevels: cachedThinkingLevelMap,
@@ -308,6 +314,60 @@ function findCatalogModelInProvider(provider: BuiltinProvider, lookupIds: string
   return undefined;
 }
 
+function messagesCompatOf(model: Model<Api>): MessagesBackendCompat | undefined {
+  // Native Messages is safe only when Pi's Anthropic catalog supplies the
+  // serializer policy for that generation. Lookup tries the exact id first, then
+  // that generation's entry; provider adapter metadata is not a wire contract.
+  if (model.api !== "anthropic-messages") return undefined;
+  const compat = (model as Model<"anthropic-messages">).compat;
+  const carried: MessagesBackendCompat = {};
+  if (compat?.forceAdaptiveThinking !== undefined) carried.forceAdaptiveThinking = compat.forceAdaptiveThinking;
+  if (compat?.supportsTemperature !== undefined) carried.supportsTemperature = compat.supportsTemperature;
+  if (compat?.supportsStrictTools !== undefined) carried.supportsStrictTools = compat.supportsStrictTools;
+  return carried;
+}
+
+function anthropicBackendLookupIds(id: string): string[] {
+  const routed = (id.split("/").pop() ?? id).toLowerCase();
+  const base = routed.replace(/^(?:[a-z0-9-]+\.)*anthropic[./]/, "");
+  const lookupIds = new Set(undecoratedBackendIds(base));
+  for (const candidate of lookupIds) {
+    const generation = /^(claude-[a-z]+-\d+)-\d+$/.exec(candidate)?.[1];
+    if (generation) lookupIds.add(generation);
+  }
+  return [...lookupIds];
+}
+
+// These are the LiteLLM adapters whose native request path can terminate at a
+// Claude backend. Other adapters may expose Claude-like public aliases, but an
+// alias alone is not evidence that LiteLLM accepts the Anthropic Messages schema.
+const CLAUDE_CAPABLE_ADAPTERS = new Set([
+  "anthropic",
+  "bedrock",
+  "bedrock_converse",
+  "vertex_ai",
+  "vertex_ai-anthropic_models",
+]);
+const CLAUDE_MODEL_PATTERN = /(?:^|[./_-])(?:claude|opus|sonnet|haiku|fable)(?:$|[./_:-])/i;
+
+function nativeMessagesCatalog(
+  entry: ModelInfoEntry,
+): Pick<CatalogResolution, "messagesCompat" | "messagesThinkingLevelMap"> {
+  const adapter = wireString(entry.model_info?.litellm_provider)?.trim().toLowerCase();
+  if (!adapter || !CLAUDE_CAPABLE_ADAPTERS.has(adapter) || deploymentFamily(entry) !== "claude") return {};
+  const candidates = [entry.litellm_params?.model, entry.model_info?.base_model]
+    .map((id) => wireString(id)?.trim())
+    .filter((id): id is string => Boolean(id));
+  if (candidates.length === 0 || !candidates.some((id) => CLAUDE_MODEL_PATTERN.test(id))) return {};
+  const models = candidates.map((id) => findCatalogModelInProvider("anthropic", anthropicBackendLookupIds(id)));
+  // Every declared backend must resolve to the same native serializer policy.
+  // An unresolved identity cannot be discarded to make the remainder unanimous.
+  if (models.some((model) => !model) || new Set(models.map((model) => model?.id)).size !== 1) return {};
+  const model = models[0]!;
+  const compat = messagesCompatOf(model);
+  return compat ? { messagesCompat: compat, messagesThinkingLevelMap: model.thinkingLevelMap } : {};
+}
+
 const ADAPTER_CATALOG_PROVIDERS: Readonly<Record<string, BuiltinProvider>> = {
   anthropic: "anthropic",
   claude: "anthropic",
@@ -326,6 +386,7 @@ const ADAPTER_CATALOG_PROVIDERS: Readonly<Record<string, BuiltinProvider>> = {
   openai: "openai",
   together_ai: "together",
   vertex_ai: "google-vertex",
+  "vertex_ai-anthropic_models": "google-vertex",
 };
 
 function adapterCatalogProvider(adapter: unknown): BuiltinProvider | undefined {
@@ -405,13 +466,13 @@ export function resolveModelInfoCatalog(
   const provider = resolveCatalogProvider(entry, identity);
   if (provider) {
     const record = publicCatalog?.lookup(provider, identity.modelId);
-    return adaptPublicCatalogRecord(provider, identity.qualifiedId, record);
+    return { ...adaptPublicCatalogRecord(provider, identity.qualifiedId, record), ...nativeMessagesCatalog(entry) };
   }
   if (!identity.family) return undefined;
 
   const publicProvider = PUBLIC_CATALOG_PROVIDER_BY_FAMILY[identity.family];
   const record = publicCatalog?.lookup(publicProvider, identity.modelId);
-  return adaptPublicCatalogRecord(publicProvider, identity.qualifiedId, record);
+  return { ...adaptPublicCatalogRecord(publicProvider, identity.qualifiedId, record), ...nativeMessagesCatalog(entry) };
 }
 
 function awaitWithSignal<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
@@ -537,6 +598,7 @@ function mapFromModelInfoGroup(
     conflictingFamilyRoutes?: string[];
     withheldRepairRoutes?: string[];
     denyLevels?: boolean;
+    allowMessages?: boolean;
   } = {},
 ): DiscoveredModel | undefined {
   const reduced = reduceModelGroup(entries, (entry) => {
@@ -550,6 +612,7 @@ function mapFromModelInfoGroup(
     const model = new Set(generations).size === 1 && family !== "conflicting" ? generations[0] : undefined;
     return {
       ...catalog,
+      ...(options.allowMessages === false ? { messagesCompat: undefined } : {}),
       ...(family ? { semanticFamily: family } : {}),
       ...(model ? { semanticModel: model } : {}),
     };
@@ -559,11 +622,12 @@ function mapFromModelInfoGroup(
   if (reduced.deploymentFamilies.includes("conflicting")) options.conflictingFamilyRoutes?.push(reduced.id);
   const protocols = entries.map((entry) => modelProtocol(reduced.id, entry));
   const protocol = protocols.find((candidate) => candidate.api === "openai-completions") ?? protocols[0]!;
-  const api = protocol.api;
+  const api = reduced.api === "anthropic-messages" ? reduced.api : protocol.api;
   const families = new Set(entries.map((entry) => resolveBackendIdentity({ ...entry, model_name: undefined })?.family));
   const [family] = families;
   const hasBackendEvidence = entries.some(hasReadableBackendEvidence);
-  const reasoningPolicy = reduced.semanticModel && hasBackendEvidence ? reduced.reasoningPolicy : undefined;
+  const reasoningPolicy =
+    api !== "anthropic-messages" && reduced.semanticModel && hasBackendEvidence ? reduced.reasoningPolicy : undefined;
   const reasoning = reasoningPolicy?.reasoning ?? reduced.reasoning;
   // The semantic policy's compat only applies on Chat, so its level map must be
   // gated the same way. Vendor compatibility is reduced from deployment
@@ -581,7 +645,7 @@ function mapFromModelInfoGroup(
   const policy = closeSerializerPolicy({
     api,
     reasoning,
-    vendorCompat,
+    vendorCompat: api === "anthropic-messages" ? reduced.messagesCompat : vendorCompat,
     semanticCompat: reduced.acceptsResponsesReasoningControl
       ? { ...reasoningPolicy?.compat, supportsReasoningEffort: true }
       : reasoningPolicy?.compat,
@@ -731,6 +795,7 @@ async function discoverFromHealth(
         conflictingFamilyRoutes,
         withheldRepairRoutes,
         denyLevels: group.some(({ denyLevels }) => denyLevels),
+        allowMessages: false,
       });
     })
     .filter((model): model is DiscoveredModel => model !== undefined);
