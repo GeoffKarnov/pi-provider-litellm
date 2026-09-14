@@ -219,19 +219,23 @@ export function createLiteLLMProvider(options: LiteLLMProviderOptions): Provider
     ...guardedProvider,
     refreshModels: async (context) => {
       const storedModels = context.stored?.models ?? [];
-      const legacyModels = storedModels.filter(
-        (model) => (model as LiteLLMModel).litellmDiscoveryVersion !== LITELLM_DISCOVERY_VERSION,
-      );
-      const models = storedModels.map((model) => (legacyModels.includes(model) ? model : enrichCachedModel(model)));
+      let legacyCount = 0;
+      const models = storedModels.map((model) => {
+        if ((model as LiteLLMModel).litellmDiscoveryVersion !== LITELLM_DISCOVERY_VERSION) {
+          legacyCount++;
+          return model;
+        }
+        return enrichCachedModel(model);
+      });
       try {
         await refreshModels({
           ...context,
           // The current pi-ai provider has no freshness gate, but force is the documented refresh contract field.
-          force: context.force || (context.allowNetwork && legacyModels.length > 0),
+          force: context.force || (context.allowNetwork && legacyCount > 0),
           stored: context.stored && { ...context.stored, models },
         });
       } catch (error) {
-        if (context.allowNetwork && legacyModels.length > 0) {
+        if (context.allowNetwork && legacyCount > 0) {
           reportUnavailable(
             `keeping cached models whose discovery metadata version does not match ` +
               `${LITELLM_DISCOVERY_VERSION} because the required network refresh failed`,
