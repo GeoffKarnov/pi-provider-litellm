@@ -510,6 +510,10 @@ function deduplicateModels(models: DiscoveredModel[]): DiscoveredModel[] {
     const chat = model.api === "openai-completions";
     if (existing) {
       existing.suppressions.push(model.suppressReasoningContent === true);
+      // Once any deployment forces the group onto Chat Completions, base the merge on that
+      // deployment's own contextWindow/maxTokens/reasoning/cost — the profile requests will
+      // actually hit — rather than whichever deployment happened to be seen first.
+      if (chat && !existing.chat) existing.model = model;
       existing.chat ||= chat;
       existing.families.add(model.litellmBackendFamily);
     } else {
