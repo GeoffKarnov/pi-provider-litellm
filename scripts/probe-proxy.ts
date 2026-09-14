@@ -441,11 +441,15 @@ async function liveRequest(
             model,
             input: "Reply with one word.",
             max_output_tokens: 16,
-            reasoning: { effort: wireLevel === "off" ? "none" : wireLevel },
+            reasoning: {
+              effort: wireLevel === "off" ? "none" : wireLevel,
+              ...(level === "off" ? {} : { summary: "auto" }),
+            },
+            ...(level === "off" ? {} : { include: ["reasoning.encrypted_content"] }),
           }
         : {
             model,
-            max_tokens: 16,
+            [compat?.maxTokensField === "max_tokens" ? "max_tokens" : "max_completion_tokens"]: 16,
             messages: [{ role: "user", content: "Reply with one word." }],
             ...chatReasoningCarrier(level, compat, thinkingLevelMap),
           };
@@ -509,7 +513,7 @@ export function chatReasoningCarrier(
   if (compat?.thinkingFormat === "deepseek") {
     return {
       thinking: { type: level === "off" ? "disabled" : "enabled" },
-      ...(supportsEffort ? { reasoning_effort: effort } : {}),
+      ...(supportsEffort && level !== "off" ? { reasoning_effort: effort } : {}),
     };
   }
   return supportsEffort ? { reasoning_effort: effort } : undefined;

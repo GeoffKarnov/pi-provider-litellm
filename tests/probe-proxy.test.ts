@@ -1,6 +1,7 @@
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { type Model, streamSimple } from "@earendil-works/pi-ai/compat";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 
@@ -430,6 +431,86 @@ describe("probeDiscovery", () => {
 });
 
 describe("live outcomes", () => {
+  it.each([
+    { name: "Chat default token field", api: "openai-completions", level: "high", compat: {} },
+    {
+      name: "Chat configured max_tokens",
+      api: "openai-completions",
+      level: "high",
+      compat: { maxTokensField: "max_tokens" },
+    },
+    {
+      name: "Chat configured max_completion_tokens",
+      api: "openai-completions",
+      level: "high",
+      compat: { maxTokensField: "max_completion_tokens" },
+    },
+    {
+      name: "DeepSeek off with effort support",
+      api: "openai-completions",
+      level: "off",
+      compat: { thinkingFormat: "deepseek", supportsReasoningEffort: true },
+    },
+    { name: "Responses high", api: "openai-responses", level: "high", compat: {} },
+    { name: "Responses off", api: "openai-responses", level: "off", compat: {} },
+  ] as const)("matches installed Pi reasoning and token fields for $name", async ({ api, level, compat }) => {
+    const model: Model<"openai-completions" | "openai-responses"> = {
+      id: "opaque",
+      name: "opaque",
+      provider: "litellm",
+      baseUrl: "https://proxy.example/v1",
+      api,
+      reasoning: true,
+      input: ["text"],
+      contextWindow: 128000,
+      maxTokens: 4096,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      compat,
+      thinkingLevelMap: { off: api === "openai-responses" ? "none" : "off", high: "high" },
+    };
+    let piBody: Record<string, unknown> | undefined;
+    await streamSimple(
+      model,
+      { messages: [{ role: "user", content: "Reply with one word.", timestamp: 1 }] },
+      {
+        apiKey: "test",
+        reasoning: level === "off" ? undefined : level,
+        maxTokens: 16,
+        maxRetries: 0,
+        fetch: async (input, init) => {
+          piBody = JSON.parse(String(input instanceof Request ? await input.clone().text() : init?.body));
+          return new Response("done", { status: 400 });
+        },
+      },
+    ).result();
+
+    let probeBody: Record<string, unknown> | undefined;
+    vi.stubGlobal("fetch", async (_input: string | URL | Request, init?: RequestInit) => {
+      probeBody = JSON.parse(String(init?.body));
+      return Response.json({});
+    });
+    await runLiveMatrix(
+      "https://proxy.example",
+      "test",
+      [{ ...probeModel, id: model.id, api, compat, thinkingLevelMap: model.thinkingLevelMap }],
+      { levels: [level] },
+    );
+
+    expect(piBody).toBeDefined();
+    expect(probeBody).toBeDefined();
+    for (const key of [
+      "max_tokens",
+      "max_completion_tokens",
+      "max_output_tokens",
+      "thinking",
+      "reasoning_effort",
+      "reasoning",
+      "include",
+    ]) {
+      expect(probeBody?.[key], key).toEqual(piBody?.[key]);
+    }
+  });
+
   it("routes Responses models through /v1/responses with the Responses request body", async () => {
     const requests: Array<{ url: string; body: unknown }> = [];
     vi.stubGlobal("fetch", async (input: string | URL | Request, init?: RequestInit) => {
@@ -463,7 +544,8 @@ describe("live outcomes", () => {
           model: "responses-model",
           input: "Reply with one word.",
           max_output_tokens: 16,
-          reasoning: { effort: "high" },
+          reasoning: { effort: "high", summary: "auto" },
+          include: ["reasoning.encrypted_content"],
         },
       },
     ]);
@@ -493,13 +575,13 @@ describe("live outcomes", () => {
     expect(requests).toEqual([
       {
         model: "kimi-thinking",
-        max_tokens: 16,
+        max_completion_tokens: 16,
         messages: [{ role: "user", content: "Reply with one word." }],
         thinking: { type: "disabled" },
       },
       {
         model: "kimi-thinking",
-        max_tokens: 16,
+        max_completion_tokens: 16,
         messages: [{ role: "user", content: "Reply with one word." }],
         thinking: { type: "enabled" },
       },
