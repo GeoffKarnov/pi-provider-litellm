@@ -25,6 +25,9 @@ const PROVIDER_FAMILIES: Readonly<Record<string, BackendFamily>> = {
   moonshot: "kimi",
   moonshotai: "kimi",
 };
+// Prefixes whose keyword match is trustworthy across the whole "prefix/modelId" string because
+// the prefix itself names a vendor, not just some unrelated string that happens to contain one.
+const KNOWN_VENDOR_PREFIXES = new Set([...Object.keys(PROVIDER_FAMILIES), "openai"]);
 // `o\d` (OpenAI's o1/o3/o4-mini reasoning models) is only trustworthy at the start of the id or
 // right after a provider path segment — an interior "-o1-" is as likely to be an unrelated
 // product's own version marker (e.g. "custom-o1-clone").
@@ -67,7 +70,12 @@ export function resolveBackendIdentity(row: BackendIdentityRow): BackendIdentity
   if (prefixProvider && customProvider && prefixProvider !== customProvider) return undefined;
   const provider = prefixProvider ?? customProvider;
   const modelId = slash > 0 ? raw.slice(slash + 1) : raw;
-  const family = semanticFamily(raw) ?? (provider ? PROVIDER_FAMILIES[provider] : undefined);
+  // Scan the full "prefix/modelId" string only when the prefix is itself a whole known vendor
+  // name (e.g. "openai/production"); otherwise scan modelId alone, so an unrelated custom
+  // prefix that merely contains a vendor substring (e.g. "deepseek-proxy/gpt-4-turbo") can't
+  // contaminate the keyword match with its own name.
+  const scanTarget = !provider || KNOWN_VENDOR_PREFIXES.has(provider) ? raw : modelId;
+  const family = semanticFamily(scanTarget) ?? (provider ? PROVIDER_FAMILIES[provider] : undefined);
   return {
     ...(provider ? { provider } : {}),
     modelId,
