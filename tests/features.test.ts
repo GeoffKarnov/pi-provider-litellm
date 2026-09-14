@@ -814,10 +814,10 @@ describe("feature parity", () => {
     const requests: Array<{ api: Api; headers: Headers; body: Record<string, unknown> }> = [];
     let retryPending = true;
     const requestFetch: typeof fetch = async (input, init) => {
-      const url = String(input);
-      const api: Api = url.endsWith("/responses")
+      const pathname = new URL(input instanceof Request ? input.url : String(input)).pathname;
+      const api: Api = pathname.endsWith("/responses")
         ? "openai-responses"
-        : url.endsWith("/messages")
+        : pathname.endsWith("/messages")
           ? "anthropic-messages"
           : "openai-completions";
       const headers = new Headers(input instanceof Request ? input.headers : init?.headers);

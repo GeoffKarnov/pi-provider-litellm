@@ -208,7 +208,7 @@ export async function createCompatibilityHarness(
       });
     }
     if (url.endsWith("/mcp-rest/tools/list")) return Response.json([]);
-    const isAnthropicRequest = url.endsWith("/v1/messages");
+    const isAnthropicRequest = new URL(url).pathname === "/v1/messages";
     if (!url.endsWith("/chat/completions") && !url.endsWith("/responses") && !isAnthropicRequest) {
       throw new Error(`unexpected URL: ${url}`);
     }

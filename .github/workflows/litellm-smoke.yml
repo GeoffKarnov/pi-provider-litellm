@@ -389,7 +389,7 @@ jobs:
             -p "Reply with one short word." | tee /tmp/pi-litellm-response-anthropic.txt
           grep -F "Anthropic mock response" /tmp/pi-litellm-response-anthropic.txt
           docker logs --since "$messages_log_since" litellm-smoke > .tmp/pi-messages.log 2>&1
-          grep -F 'POST /v1/messages HTTP/1.1" 200' .tmp/pi-messages.log
+          grep -E 'POST /v1/messages(\?beta=true)? HTTP/1.1" 200' .tmp/pi-messages.log
 
       - name: Assert captured LiteLLM endpoint logs
         shell: bash
@@ -403,7 +403,7 @@ jobs:
           # The smoke runner posts to /v1/messages itself, so coverage alone cannot
           # prove the extension's native Messages path. Require both that request and
           # the Pi CLI request asserted in the scoped grep above.
-          messages_requests="$(grep -c -F 'POST /v1/messages HTTP/1.1" 200' .tmp/litellm.log || true)"
+          messages_requests="$(grep -c -E 'POST /v1/messages(\?beta=true)? HTTP/1.1" 200' .tmp/litellm.log || true)"
           messages_requests="${messages_requests:-0}"
           echo "captured /v1/messages requests: $messages_requests"
           test "$messages_requests" -ge 2

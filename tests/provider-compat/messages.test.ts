@@ -123,7 +123,7 @@ describe("Anthropic Messages wire compatibility", () => {
     const message = await models.streamSimple(model, { messages: [user("Hello")] }).result();
 
     expect(model.api).toBe("anthropic-messages");
-    expect(requestUrls).toEqual(["https://proxy.example.com/v1/messages"]);
+    expect(requestUrls).toEqual(["https://proxy.example.com/v1/messages?beta=true"]);
     expect(requestUrls[0]).not.toContain("/v1/v1/messages");
     expect(message.content).toEqual([{ type: "text", text: "Hello from Messages" }]);
     expect(message.usage).toMatchObject({ input: 2, output: 1 });
@@ -156,7 +156,7 @@ describe("Anthropic Messages wire compatibility", () => {
       api: "anthropic-messages",
       baseUrl: "http://host.docker.internal",
     });
-    expect(requestUrls).toEqual(["http://host.docker.internal/v1/messages"]);
+    expect(requestUrls).toEqual(["http://host.docker.internal/v1/messages?beta=true"]);
   });
 
   it("rejects non-loopback HTTP when the provider does not opt in", async () => {
@@ -276,7 +276,7 @@ describe("Anthropic Messages wire compatibility", () => {
 
     await models.streamSimple(model, { messages: [user("Think carefully")] }, { reasoning: "max" }).result();
 
-    expect(model.thinkingLevelMap).toEqual({ xhigh: null, max: "max" });
+    expect(model.thinkingLevelMap).toEqual({ off: null, xhigh: null, max: "max" });
     expect(requests[0]).toMatchObject({ thinking: { type: "adaptive" }, output_config: { effort: "max" } });
   });
 
@@ -411,7 +411,7 @@ describe("Anthropic Messages wire compatibility", () => {
 
     expect(offline.model.api).toBe("anthropic-messages");
     expect(offline.model).toEqual(online.model);
-    expect(offline.requestUrls).toEqual(["https://proxy.example.com/v1/messages"]);
+    expect(offline.requestUrls).toEqual(["https://proxy.example.com/v1/messages?beta=true"]);
     expect(offline.requests[0]).toEqual(online.requests[0]);
     expect(offline.requests[0]).toMatchObject({
       thinking: { type: "adaptive" },

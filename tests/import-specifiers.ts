@@ -1,6 +1,6 @@
 import { SyntaxKind } from "@typescript/native-preview/unstable/ast";
 import { createScanner } from "@typescript/native-preview/unstable/ast/scanner";
-import { init, parse } from "es-module-lexer";
+import { init, parse } from "es-module-lexer/minimal";
 
 // Extracts module specifiers from source text so the package-load contract can assert that
 // `src/` only imports things Pi's loader provides. es-module-lexer parses ESM imports, while
@@ -9,12 +9,9 @@ import { init, parse } from "es-module-lexer";
 export const UNVERIFIABLE_SPECIFIER = "<unverifiable-dynamic-specifier>";
 export const FORBIDDEN_RESOLVER = "<forbidden-dynamic-resolver>";
 
-let ready: Promise<void> | undefined;
-
 // es-module-lexer compiles a WASM module on first use.
 export async function initImportSpecifiers(): Promise<void> {
-  ready ??= init;
-  await ready;
+  await init();
 }
 
 const REGEX_PRECEDERS = new Set([
@@ -138,7 +135,10 @@ function containsForbiddenResolver(source: string): boolean {
 
 export function importSpecifiers(source: string, filename = "source.ts"): string[] {
   const [imports] = parse(source, filename);
-  const specifiers = imports.map((entry) => entry.n ?? UNVERIFIABLE_SPECIFIER);
+  // v3 also decodes plain templates; keep the guard limited to quoted import specifiers.
+  const specifiers = imports.map((entry) =>
+    entry.d >= 0 && source[entry.s] === "`" ? UNVERIFIABLE_SPECIFIER : (entry.n ?? UNVERIFIABLE_SPECIFIER),
+  );
   if (containsForbiddenResolver(source)) specifiers.push(FORBIDDEN_RESOLVER);
   return specifiers;
 }
