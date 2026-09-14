@@ -1,3 +1,6 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type {
   Api,
   Credential,
@@ -6,22 +9,34 @@ import type {
   ProviderAuth,
   RefreshModelsContext,
 } from "@earendil-works/pi-ai";
-import { afterEach, beforeEach, describe, expect, it, type MockInstance, vi } from "vitest";
+import { afterAll, afterEach, beforeEach, describe, expect, it, type MockInstance, vi } from "vitest";
 import { discoverModels } from "../src/discover.js";
 import { createLiteLLMProvider, toNativeModels } from "../src/provider.js";
 import type { DiscoveryResult, LiteLLMModel } from "../src/types.js";
 
+const agentDir = await mkdtemp(join(tmpdir(), "pi-litellm-provider-"));
 const apiSpies = vi.hoisted(() => ({ completions: vi.fn(), responses: vi.fn() }));
 vi.mock("@earendil-works/pi-ai/compat", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@earendil-works/pi-ai/compat")>()),
   openAICompletionsApi: () => ({ stream: apiSpies.completions, streamSimple: apiSpies.completions }),
   openAIResponsesApi: () => ({ stream: apiSpies.responses, streamSimple: apiSpies.responses }),
 }));
+vi.mock("@earendil-works/pi-coding-agent", () => ({
+  getAgentDir: () => agentDir,
+}));
 
 const credential: Credential = { type: "api_key", key: "secret" };
 const auth: ProviderAuth = {
   apiKey: { name: "API key", resolve: async () => ({ auth: { apiKey: "secret" } }) },
 };
+
+afterAll(async () => {
+  await rm(agentDir, { recursive: true, force: true });
+});
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
 
 const discovered = (id: string): DiscoveryResult => ({
   source: "model_info",
@@ -49,10 +64,10 @@ function foreignApiModel(id: string, api = "anthropic-messages"): Model<"openai-
 
 type TestRefreshContext = RefreshModelsContext & { publications: ModelsPublication[] };
 
-function context(initial: readonly Model<Api>[] | undefined, allowNetwork: boolean): TestRefreshContext {
+function context(initial: readonly Model<Api>[] | undefined, allowNetwork: boolean, checkedAt = 1): TestRefreshContext {
   const publications: ModelsPublication[] = [];
   return {
-    stored: initial ? { models: initial, checkedAt: 1 } : undefined,
+    stored: initial ? { models: initial, checkedAt } : undefined,
     allowNetwork,
     credential,
     signal: new AbortController().signal,
@@ -198,10 +213,10 @@ describe("createLiteLLMProvider", () => {
         id: "opus-5",
         name: "Claude Opus 5",
         reasoning: true,
-        thinkingLevelMap: { xhigh: "xhigh", max: "max" },
+        thinkingLevelMap: { off: null, minimal: null, low: null, medium: null, high: null, xhigh: null, max: null },
         provider: "litellm",
         api: "openai-completions",
-        compat: { supportsStore: false, cacheControlFormat: "anthropic" },
+        compat: { supportsStore: false, cacheControlFormat: "anthropic", supportsReasoningEffort: false },
         baseUrl: "https://proxy.example/v1",
       }),
     ]);
@@ -269,7 +284,7 @@ describe("createLiteLLMProvider", () => {
     expect(discover).not.toHaveBeenCalled();
   });
 
-  it("keeps partially enriched stale cached aliases unchanged offline", async () => {
+  it("does not re-enrich partially enriched cached aliases offline", async () => {
     const legacyFallback: LiteLLMModel = {
       ...native("opus-5"),
       name: "opus-5 (no metadata)",
@@ -292,7 +307,23 @@ describe("createLiteLLMProvider", () => {
 
       await value.refreshModels?.(context([cached], false));
 
-      expect(value.getModels()).toEqual([cached]);
+      expect(value.getModels()).toEqual([
+        cached.reasoning
+          ? {
+              ...cached,
+              thinkingLevelMap: {
+                off: null,
+                minimal: null,
+                low: null,
+                medium: null,
+                high: null,
+                xhigh: null,
+                max: null,
+              },
+              compat: undefined,
+            }
+          : cached,
+      ]);
     }
   });
 
@@ -591,6 +622,113 @@ describe("createLiteLLMProvider", () => {
 
 // Reduced groups deliberately use a permanent marker so offline cache reads
 // cannot re-authorize metadata that discovery withheld.
+describe("discovery cache version transition", () => {
+  const legacyModel = () => ({
+    ...native("legacy"),
+    reasoning: true,
+    thinkingLevelMap: { low: null },
+    litellmDiscoveryVersion: undefined,
+  });
+  const legacyMoonshotModel = () => ({
+    ...legacyModel(),
+    id: "moonshot/kimi-k2.6",
+    compat: {
+      supportsStore: false,
+      supportsDeveloperRole: false,
+      supportsReasoningEffort: false,
+      supportsStrictMode: false,
+      maxTokensField: "max_tokens" as const,
+    },
+  });
+  const restorableV2Model = () => ({
+    ...native("moonshot/kimi-k2.6"),
+    litellmDiscoveryVersion: 2 as const,
+    compat: {
+      supportsStore: false,
+      supportsDeveloperRole: false,
+      supportsReasoningEffort: false,
+      supportsStrictMode: false,
+      maxTokensField: "max_tokens" as const,
+    },
+    litellmPolicy: undefined,
+  });
+
+  it("refreshes and replaces a legacy store when the network phase runs", async () => {
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const discover = vi.fn(async () => discovered("fresh"));
+    const provider = controller({ discover });
+    const legacy = legacyModel();
+
+    await provider.refreshModels?.(context([legacy], false));
+    const networkRefresh = context([legacy], true, Date.now());
+    await provider.refreshModels?.(networkRefresh);
+
+    expect(discover).toHaveBeenCalledOnce();
+    expect(provider.getModels().map((model) => model.id)).toEqual(["fresh"]);
+    expect(networkRefresh.publications.find((publication) => publication.persist)?.persist?.models[0]?.id).toBe(
+      "fresh",
+    );
+    expect(stderr).not.toHaveBeenCalled();
+  });
+
+  it("restores response policy without rewriting legacy reasoning levels offline", async () => {
+    const discover = vi.fn();
+    const provider = controller({ discover });
+    const legacy = legacyMoonshotModel();
+
+    await provider.refreshModels?.(context([legacy], false));
+
+    expect(discover).not.toHaveBeenCalled();
+    expect(provider.getModels()[0]).toMatchObject({
+      thinkingLevelMap: { low: null },
+      litellmPolicy: {
+        normalizeStrictToolMessages: false,
+        normalizeThinkTags: true,
+        suppressReasoningVisibility: false,
+      },
+    });
+  });
+
+  it("handles mixed stores per entry without warning during offline restore", async () => {
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const discover = vi.fn();
+    const provider = controller({ discover });
+    const legacy = legacyModel();
+    const v2 = restorableV2Model();
+
+    await provider.refreshModels?.(context([legacy, v2], false));
+
+    expect(discover).not.toHaveBeenCalled();
+    expect(provider.getModels()[0]).toEqual(legacy);
+    expect((provider.getModels()[1] as ReturnType<typeof restorableV2Model> | undefined)?.litellmPolicy).toEqual({
+      normalizeStrictToolMessages: false,
+      normalizeThinkTags: true,
+      suppressReasoningVisibility: false,
+    });
+    expect(stderr).not.toHaveBeenCalled();
+  });
+
+  it("warns once when repeated refresh attempts leave a mixed legacy store in place", async () => {
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const discover = vi.fn(async () => {
+      throw new Error("refresh failed");
+    });
+    const provider = controller({ discover });
+    const legacy = legacyModel();
+    const stored = [legacy, restorableV2Model()];
+
+    await provider.refreshModels?.(context(stored, false));
+    await expect(provider.refreshModels?.(context(stored, true))).rejects.toThrow("refresh failed");
+    await provider.refreshModels?.(context(stored, false));
+    await expect(provider.refreshModels?.(context(stored, true))).rejects.toThrow("refresh failed");
+
+    expect(provider.getModels()[0]).toEqual(legacy);
+    expect((provider.getModels()[1] as ReturnType<typeof restorableV2Model> | undefined)?.litellmPolicy).toBeDefined();
+    expect(stderr).toHaveBeenCalledTimes(1);
+    expect(stderr).toHaveBeenCalledWith(expect.stringContaining("required network refresh failed"));
+  });
+});
+
 describe("discovery and offline cache parity", () => {
   let fetchSpy: MockInstance<typeof fetch> | undefined;
 

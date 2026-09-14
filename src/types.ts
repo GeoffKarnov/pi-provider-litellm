@@ -12,8 +12,27 @@ export type LiteLLMRuntimeAuth = {
   allowInsecureHttp?: boolean;
 };
 
+export interface LiteLLMModelPolicy {
+  // Moonshot/Kimi's strict schema requires assistant tool calls to carry string
+  // content. Discovery enables this outbound rewrite only from deployment evidence.
+  normalizeStrictToolMessages: boolean;
+  // Moonshot routes can inline reasoning as `<think>` text in the visible
+  // answer. Whether to unwrap it is a per-model conclusion discovery reaches
+  // from deployment evidence, carried here so the `message_end` hook does not
+  // re-derive it from the route name.
+  normalizeThinkTags: boolean;
+  // Hide duplicate visible reasoning only for deployment-evidenced Kimi routes
+  // that do not use an always-thinking generation.
+  suppressReasoningVisibility: boolean;
+  // Gemini-backed deployments require lowercase effort values. Discovery carries
+  // this evidence so the request hook does not infer a backend from the route name.
+  normalizeGeminiReasoningEffort?: boolean;
+}
+
 export type DiscoveredModelFor<TApi extends LiteLLMApi> = Omit<Model<TApi>, "provider" | "baseUrl"> & {
   suppressReasoningContent?: boolean;
+  litellmPolicy?: LiteLLMModelPolicy;
+  litellmResponsesReasoningControl?: true;
   litellmBackendFamily?: BackendFamily;
   litellmDiscoveryVersion?: typeof LITELLM_DISCOVERY_VERSION;
 };
@@ -28,6 +47,8 @@ export type ModelProtocol = {
 
 export type LiteLLMModel = Model<LiteLLMApi> & {
   suppressReasoningContent?: boolean;
+  litellmPolicy?: LiteLLMModelPolicy;
+  litellmResponsesReasoningControl?: true;
   litellmBackendFamily?: BackendFamily;
   litellmDiscoveryVersion?: typeof LITELLM_DISCOVERY_VERSION;
 };
@@ -52,6 +73,7 @@ export interface ModelInfoEntry {
     model?: string;
     custom_llm_provider?: string;
     api_version?: string;
+    allowed_openai_params?: string[];
   };
   model_info?: {
     id?: string;
@@ -59,6 +81,7 @@ export interface ModelInfoEntry {
     base_model?: string;
     litellm_provider?: string;
     supported_endpoints?: string[];
+    supported_openai_params?: string[];
     input_cost_per_token?: number;
     output_cost_per_token?: number;
     cache_read_input_token_cost?: number;
@@ -69,8 +92,6 @@ export interface ModelInfoEntry {
     supports_none_reasoning_effort?: boolean;
     supports_minimal_reasoning_effort?: boolean;
     supports_low_reasoning_effort?: boolean;
-    supports_medium_reasoning_effort?: boolean;
-    supports_high_reasoning_effort?: boolean;
     supports_xhigh_reasoning_effort?: boolean;
     supports_max_reasoning_effort?: boolean;
     supports_vision?: boolean;

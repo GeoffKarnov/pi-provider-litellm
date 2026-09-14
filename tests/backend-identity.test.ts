@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { isOpenAIBackend, LITELLM_DISCOVERY_VERSION, resolveBackendIdentity } from "../src/backend-identity.js";
+import {
+  isOpenAIBackend,
+  LITELLM_DISCOVERY_VERSION,
+  resolveBackendIdentity,
+  resolveCatalogProvider,
+} from "../src/backend-identity.js";
 
 describe("resolveBackendIdentity", () => {
   it("uses base_model before the configured model and route name", () => {
@@ -108,7 +113,63 @@ describe("resolveBackendIdentity", () => {
     expect(LITELLM_DISCOVERY_VERSION).toBe(2);
   });
 
+  it("classifies codex-mini-latest as an OpenAI backend", () => {
+    expect(
+      resolveBackendIdentity({ model_name: "route", litellm_params: { model: "codex-mini-latest" } })?.family,
+    ).toBe("openai");
+  });
+
   it("recognizes Fable as a Claude-family model", () => {
     expect(resolveBackendIdentity({ model_name: "fable-5" })).toMatchObject({ family: "claude" });
+  });
+});
+
+describe("resolveCatalogProvider", () => {
+  it.each(["azure", "azure_ai", "custom_openai", "openai", "openai_like", "text-completion-openai"])(
+    "prefers the configured adapter over generic %s metadata",
+    (reported) => {
+      expect(
+        resolveCatalogProvider({
+          model_info: { base_model: "openai/gpt-5.2", litellm_provider: reported },
+          litellm_params: { custom_llm_provider: "azure" },
+        }),
+      ).toBe("azure");
+    },
+  );
+
+  it.each([
+    ["fireworks_ai/accounts/fireworks/models/kimi-k3", "azure", "fireworks_ai"],
+    ["anthropic/claude-sonnet-4-6", "custom_openai", "anthropic"],
+  ])("preserves specific backend %s authority through %s", (model, adapter, provider) => {
+    expect(
+      resolveCatalogProvider({
+        model_info: { base_model: model, litellm_provider: adapter },
+        litellm_params: { custom_llm_provider: adapter },
+      }),
+    ).toBe(provider);
+  });
+
+  it("preserves a resolved provider over non-generic reported metadata", () => {
+    expect(
+      resolveCatalogProvider({
+        model_info: { base_model: "openai/gpt-5.2", litellm_provider: "anthropic" },
+        litellm_params: { custom_llm_provider: "azure" },
+      }),
+    ).toBe("openai");
+  });
+
+  it("falls back to reported then configured provider without an identity", () => {
+    expect(
+      resolveCatalogProvider({
+        model_info: { litellm_provider: " groq " },
+        litellm_params: { custom_llm_provider: "azure" },
+      }),
+    ).toBe("groq");
+    expect(
+      resolveCatalogProvider({
+        model_info: { litellm_provider: "undefined" },
+        litellm_params: { custom_llm_provider: " azure " },
+      }),
+    ).toBe("azure");
   });
 });

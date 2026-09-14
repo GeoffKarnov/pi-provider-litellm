@@ -13,6 +13,7 @@
 - Use `npm ci` when reinstalling dependencies from the lockfile.
 - Use `npm test` for the full test suite.
 - Use `npm test -- tests/<file>.test.ts` for a focused Vitest run.
+- Use `npm run probe:proxy -- --snapshot <fixture> [--src <worktree>]` for snapshot probing, or `npm run probe:proxy -- --live --base-url $LITELLM_DEV_BASE_URL --max-requests 100` for the bounded live matrix. Live Chat probes pass through the same discovered request policy as Pi.
 - Use `npm run check` before committing code changes; it runs Biome, typecheck, tests, and the package-content guard.
 - Use `npm run clean && npm run build` when changing exported/runtime code.
 - Use `npm run supply-chain:guard` and `npm pack --dry-run` when package contents, dependency policy, or release packaging change.
@@ -46,7 +47,7 @@
 - `before_provider_request` is a global Pi hook. Only mutate provider payloads when `ctx.model?.provider` matches the default `litellm` provider or a registered alias from `litellm.providers`.
 - Do not add user-facing flags or environment variables to hide provider-scoping bugs.
 - `before_provider_headers` sends Pi's canonical session id as `x-litellm-session-id`, scoped to the configured LiteLLM provider names; no session field is added to request bodies.
-- Kimi/Moonshot responses may include `<think>` text; Pi-visible normalization happens in the `message_end` hook and follows either a Moonshot-named model id or the discovered request-side suppression flag. Keep both paths covered by feature tests.
+- Kimi/Moonshot responses may include `<think>` text; Pi-visible normalization in `message_end` follows discovered response policy. Request-side visibility suppression additionally requires every deployment's routing provider to be Moonshot. Keep hosted Kimi paths covered by feature tests.
 
 ## LiteLLM MCP Tools
 
@@ -68,6 +69,13 @@
   - `typebox`'s `value/convert/from_object.mjs` turns `properties` keys into `new RegExp(`^${key}$`)` with **no escaping**, and `pi-ai` calls `Value.Convert` on tool parameters. That is only harmless because `Convert` walks recognised TypeBox types and no-ops on a raw JSON Schema, so a proxy-supplied property name never reaches it. If that changed, a property named `(a+)+$` would become an executable backtracking regex tested against model-supplied argument keys.
   - `format` is live on passthrough schemas: it is a proxy-chosen selector of `typebox`'s own regexes, executed against model-supplied strings. The shipped formats are well-anchored, so this is a residual dependency on upstream regex quality, not a hole. Do not assume `format` is ignored.
 - Do not write timing-based tests for any of this. Assert the registered `parameters` and the absence of the exact proxy-supplied regex or ref, and keep the schema-position test lists independent of the implementation's own tables.
+
+## Reasoning Policy
+
+- Discovered `litellmPolicy` scopes request and response behavior to backend evidence; route text never authorizes generation controls or request-side visibility parameters.
+- Share bounded backend identity parsing across catalog, family, and generation decisions. Generic adapter labels do not override an identified backend vendor; custom Azure authority wins over a generic OpenAI adapter.
+- `medium` and `high` have no LiteLLM support flags. Null/absent flags have no opinion; explicit denials win and extended effort levels need explicit support.
+- Close thinking levels against the protocol and accepted carrier actually used after wildcard expansion. Responses compatibility contains only Responses fields.
 
 ## Compatibility Rules
 

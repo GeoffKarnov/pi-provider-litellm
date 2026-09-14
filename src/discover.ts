@@ -2,16 +2,20 @@ import { isIP } from "node:net";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import { getModels, getProviders } from "@earendil-works/pi-ai/compat";
 import type { BuiltinProvider } from "@earendil-works/pi-ai/providers/all";
-import { LITELLM_DISCOVERY_VERSION, resolveBackendIdentity } from "./backend-identity.js";
+import { LITELLM_DISCOVERY_VERSION, resolveBackendIdentity, resolveCatalogProvider } from "./backend-identity.js";
 import {
   type CatalogResolution,
   catalogResolution,
+  closeSerializerPolicy,
   conservativeCostTiers,
   DEFAULT_CONTEXT_WINDOW,
   DEFAULT_MAX_TOKENS,
   hasMixedIncompatibleDeploymentModes,
+  meetVendorCompat,
   normalizedMode,
   reduceModelGroup,
+  type SemanticFamily,
+  type SemanticModel,
   wireString,
 } from "./model-groups.js";
 import { loadPublicCatalog, type PublicCatalog, type PublicCatalogRecord } from "./public-catalog.js";
@@ -22,6 +26,7 @@ import type {
   DiscoveryOptions,
   DiscoveryResult,
   HealthResponse,
+  LiteLLMModelPolicy,
   ModelInfoEntry,
   ModelInfoResponse,
   ModelProtocol,
@@ -30,6 +35,26 @@ import type {
 } from "./types.js";
 
 const DEFAULT_TIMEOUT_MS = 5000;
+const HEALTH_DETAIL_CONCURRENCY = 8;
+const reportedConflictingFamilyRoutes = new Set<string>();
+const reportedWithheldRepairRoutes = new Set<string>();
+interface HealthDeployment {
+  entry: ModelInfoEntry;
+  denyLevels: boolean;
+  synthetic: boolean;
+}
+interface WildcardExpansionSource {
+  model: DiscoveredModel;
+  deploymentFamilies: readonly CatalogResolution["semanticFamily"][];
+}
+const GENERIC_TRANSPORT_ADAPTERS = new Set([
+  "azure",
+  "azure_ai",
+  "custom_openai",
+  "openai",
+  "openai_like",
+  "text-completion-openai",
+]);
 const PUBLIC_CATALOG_BUDGET_MS = 1000;
 const PUBLIC_CATALOG_PROVIDER_BY_FAMILY = {
   claude: "anthropic",
@@ -71,38 +96,6 @@ export function isGpt55Model(modelId: string): boolean {
   return GPT55_MODEL_PATTERN.test(modelId);
 }
 
-const MOONSHOT_ROUTE_PROVIDERS = new Set(["moonshot", "moonshotai"]);
-
-function isMoonshotRoute(entry: ModelInfoEntry): boolean {
-  const params = entry.litellm_params;
-  if (!params) return false;
-  const model = wireString(params.model)?.trim();
-  if (!model) return false;
-  const providers = [
-    wireString(params.custom_llm_provider)?.trim(),
-    model.includes("/") ? model.split("/", 1)[0] : undefined,
-  ].filter((provider): provider is string => Boolean(provider));
-  return providers.length > 0 && providers.every((provider) => MOONSHOT_ROUTE_PROVIDERS.has(provider.toLowerCase()));
-}
-
-function shouldSuppressRouteReasoningContent(modelId: string, entry: ModelInfoEntry): boolean {
-  const routeModelId = wireString(entry.litellm_params?.model);
-  return (
-    isMoonshotRoute(entry) &&
-    !FORCED_THINKING_MODEL_PATTERN.test(modelId) &&
-    !(routeModelId && FORCED_THINKING_MODEL_PATTERN.test(routeModelId))
-  );
-}
-
-function aggregateSuppressionEvidence(evidence: Iterable<boolean>): boolean {
-  let hasEvidence = false;
-  for (const suppress of evidence) {
-    hasEvidence = true;
-    if (!suppress) return false;
-  }
-  return hasEvidence;
-}
-
 function shouldSuppressReasoningContent(modelId: string): boolean {
   return isMoonshotModel(modelId) && !FORCED_THINKING_MODEL_PATTERN.test(modelId);
 }
@@ -117,8 +110,13 @@ export function responsesCompat(modelId: string): DiscoveredModelFor<"openai-res
   return isMoonshotModel(modelId) ? { supportsDeveloperRole: false } : undefined;
 }
 
-export function completionsCompat(modelId: string): DiscoveredModelFor<"openai-completions">["compat"] {
-  if (isMoonshotModel(modelId)) {
+export function completionsCompat(
+  modelId: string,
+  semanticFamily?: CatalogResolution["semanticFamily"],
+): DiscoveredModelFor<"openai-completions">["compat"] {
+  // Conflicting deployment evidence must not re-enable route-name inference.
+  if (semanticFamily === "conflicting") return { supportsStore: false };
+  if (semanticFamily === "kimi" || (semanticFamily === undefined && isMoonshotModel(modelId))) {
     return {
       supportsStore: false,
       supportsDeveloperRole: false,
@@ -127,7 +125,7 @@ export function completionsCompat(modelId: string): DiscoveredModelFor<"openai-c
       maxTokensField: "max_tokens",
     };
   }
-  if (ANTHROPIC_MODEL_PATTERN.test(modelId)) {
+  if (semanticFamily === "claude" || (semanticFamily === undefined && ANTHROPIC_MODEL_PATTERN.test(modelId))) {
     return { supportsStore: false, cacheControlFormat: "anthropic" };
   }
   return { supportsStore: false };
@@ -207,11 +205,27 @@ function findCatalogModel(id: string, ownedBy?: string): Model<Api> | undefined 
   return resolveCatalogModel(id, ownedBy)?.model;
 }
 
-export function enrichCachedModel(model: Model<Api>): Model<Api> {
-  // This sentinel is emitted only by the evidence-free `/v1/models` fallback, so
-  // re-deriving catalog metadata from the model id here cannot re-authorize a
-  // reduced `/model/info` group whose catalog authority was withheld. Reduced
-  // groups carry the distinct ` (incomplete metadata)` marker instead.
+export function enrichCachedModel(input: Model<Api>): Model<Api> {
+  const restored = restoreCachedModelPolicy(input);
+  // A model stored by a release that predates the transmissibility gate carries
+  // whatever level map that release published, so the gate applies to the cached
+  // map on the way in — not only to catalog metadata on the way out, which every
+  // reasoning model skips via the guard below.
+  const { thinkingLevelMap: cachedThinkingLevelMap, ...restoredWithoutLevels } = restored;
+  const model = {
+    ...restoredWithoutLevels,
+    ...closeSerializerPolicy({
+      api: restored.api === "openai-responses" ? "openai-responses" : "openai-completions",
+      reasoning: restored.reasoning,
+      vendorCompat: restored.compat,
+      catalogLevels: cachedThinkingLevelMap,
+      requireChatCarrier: true,
+      allowInferredChatCarrier: false,
+      acceptsResponsesReasoningControl: hasResponsesReasoningControl(restored),
+    }),
+  } as Model<Api>;
+  // Reduced deployment groups use a distinct marker; this sentinel remains
+  // exclusive to evidence-free fallback models that may be enriched safely.
   if (
     !model.name.endsWith(" (no metadata)") ||
     model.reasoning ||
@@ -230,25 +244,50 @@ export function enrichCachedModel(model: Model<Api>): Model<Api> {
   }
   const catalogModel = findCatalogModel(model.id);
   if (!catalogModel) return model;
+  // Match evidence-free discovery: only an explicit Responses catalog transport
+  // changes the protocol; all other catalog APIs continue through Chat.
+  const api = catalogModel.api === "openai-responses" ? "openai-responses" : "openai-completions";
   return {
     ...model,
     name: catalogModel.name,
-    reasoning: catalogModel.reasoning,
-    thinkingLevelMap: catalogModel.thinkingLevelMap,
+    // The cached compat stays as stored, so catalog levels are closed against it
+    // rather than trusted because the catalog offered them.
+    ...closeSerializerPolicy({
+      api,
+      reasoning: catalogModel.reasoning,
+      vendorCompat: catalogProtocol(model.id, catalogModel).compat,
+      catalogLevels: catalogModel.thinkingLevelMap,
+      requireChatCarrier: true,
+      allowInferredChatCarrier: false,
+      acceptsResponsesReasoningControl: hasResponsesReasoningControl(model),
+    }),
     input: catalogModel.input,
     cost: catalogModel.cost,
     contextWindow: catalogModel.contextWindow,
     maxTokens: catalogModel.maxTokens,
-    ...catalogProtocol(model.id, catalogModel),
+    api,
   };
 }
 
-function catalogLookupIds(id: string): string[] {
-  const lookupIds = new Set([id]);
-  const unprefixed = id.includes("/") ? id.slice(id.indexOf("/") + 1) : id;
-  lookupIds.add(unprefixed);
+function undecoratedBackendIds(id: string): string[] {
+  const normalized = id.toLowerCase();
+  const unprefixed = normalized.includes("/") ? normalized.slice(normalized.indexOf("/") + 1) : normalized;
+  const routed = normalized.split("/").pop() ?? normalized;
+  const variants = (candidate: string): string[] => {
+    const undecorated = candidate.replace(/-v\d+(?::\d+)?$/, "").replace(/@[a-z0-9-]+$/, "");
+    return [candidate, candidate.replace(/:\d+$/, ""), undecorated, undecorated.replace(/-\d{8}$/, "")];
+  };
+  return [...new Set([...variants(unprefixed), ...variants(routed)].filter(Boolean))];
+}
 
-  const anthropicAlias = unprefixed.toLowerCase().replaceAll(".", "-");
+function catalogLookupIds(id: string): string[] {
+  const normalized = id.toLowerCase();
+  const lookupIds = new Set([normalized]);
+  const unprefixed = normalized.includes("/") ? normalized.slice(normalized.indexOf("/") + 1) : normalized;
+  lookupIds.add(unprefixed);
+  for (const candidate of undecoratedBackendIds(id)) lookupIds.add(candidate);
+
+  const anthropicAlias = unprefixed.replaceAll(".", "-");
   const match = /^(?:claude-)?(opus|sonnet|haiku)-(\d+)-(\d+)$/.exec(anthropicAlias);
   if (match) lookupIds.add(`claude-${match[1]}-${match[2]}-${match[3]}`);
   if (anthropicAlias === "fable-5" || anthropicAlias === "opus-5") lookupIds.add(`claude-${anthropicAlias}`);
@@ -257,10 +296,13 @@ function catalogLookupIds(id: string): string[] {
 }
 
 function findCatalogModelInProvider(provider: BuiltinProvider, lookupIds: string[]): Model<Api> | undefined {
+  const models = getModels(provider);
   for (const lookupId of lookupIds) {
-    const exact = getModels(provider).find((model) => model.id === lookupId);
+    const normalized = lookupId.toLowerCase();
+    const exact = models.find((model) => model.id.toLowerCase() === normalized);
     if (exact) return exact;
-    const providerQualified = getModels(provider).find((model) => model.id === `${provider}/${lookupId}`);
+    const qualified = `${provider}/${normalized}`;
+    const providerQualified = models.find((model) => model.id.toLowerCase() === qualified);
     if (providerQualified) return providerQualified;
   }
   return undefined;
@@ -309,7 +351,10 @@ function adaptPublicCatalogRecord(
     // so two spellings of one backend model reduce to one identity instead of a conflict.
     catalogModelId: resolved?.model.id ?? record?.modelId ?? catalogModelId,
     ...(piCatalog?.reasoning !== undefined ? { reasoning: piCatalog.reasoning } : {}),
-    ...(piCatalog?.thinkingLevelMap ? { thinkingLevelMap: piCatalog.thinkingLevelMap } : {}),
+    ...(record?.effortLevels ? { reasoning: true, effortLevels: record.effortLevels } : {}),
+    ...((record?.thinkingLevelMap ?? piCatalog?.thinkingLevelMap)
+      ? { thinkingLevelMap: record?.thinkingLevelMap ?? piCatalog?.thinkingLevelMap }
+      : {}),
     ...(record?.modalities
       ? { vision: record.modalities.includes("image") }
       : piCatalog?.vision !== undefined
@@ -357,9 +402,10 @@ export function resolveModelInfoCatalog(
   if (!hasBackendIdentity) return undefined;
   const identity = resolveBackendIdentity(entry);
   if (!identity) return undefined;
-  if (identity.provider) {
-    const record = publicCatalog?.lookup(identity.provider, identity.modelId);
-    return adaptPublicCatalogRecord(identity.provider, identity.qualifiedId, record);
+  const provider = resolveCatalogProvider(entry, identity);
+  if (provider) {
+    const record = publicCatalog?.lookup(provider, identity.modelId);
+    return adaptPublicCatalogRecord(provider, identity.qualifiedId, record);
   }
   if (!identity.family) return undefined;
 
@@ -485,37 +531,100 @@ function reportIncompatibleDeploymentModes(routes: readonly string[]): void {
 
 function mapFromModelInfoGroup(
   entries: readonly ModelInfoEntry[],
-  publicCatalog?: PublicCatalog,
-  ambiguousRoutes?: string[],
+  publicCatalog: PublicCatalog | undefined,
+  options: {
+    ambiguousRoutes?: string[];
+    conflictingFamilyRoutes?: string[];
+    withheldRepairRoutes?: string[];
+    denyLevels?: boolean;
+  } = {},
 ): DiscoveredModel | undefined {
-  const reduced = reduceModelGroup(entries, (entry) => resolveModelInfoCatalog(entry, publicCatalog));
+  const reduced = reduceModelGroup(entries, (entry) => {
+    const catalog = resolveModelInfoCatalog(entry, publicCatalog);
+    const family = deploymentFamily(entry);
+    const generations = [entry.litellm_params?.model, entry.model_info?.base_model]
+      .map((id) => wireString(id)?.trim())
+      .filter((id): id is string => Boolean(id))
+      .map(semanticModel)
+      .filter((model): model is SemanticModel => model !== undefined);
+    const model = new Set(generations).size === 1 && family !== "conflicting" ? generations[0] : undefined;
+    return {
+      ...catalog,
+      ...(family ? { semanticFamily: family } : {}),
+      ...(model ? { semanticModel: model } : {}),
+    };
+  });
   if (!reduced) return undefined;
-  if (reduced.catalogAuthorityAmbiguous) ambiguousRoutes?.push(reduced.id);
+  if (reduced.catalogAuthorityAmbiguous) options.ambiguousRoutes?.push(reduced.id);
+  if (reduced.deploymentFamilies.includes("conflicting")) options.conflictingFamilyRoutes?.push(reduced.id);
   const protocols = entries.map((entry) => modelProtocol(reduced.id, entry));
   const protocol = protocols.find((candidate) => candidate.api === "openai-completions") ?? protocols[0]!;
+  const api = protocol.api;
   const families = new Set(entries.map((entry) => resolveBackendIdentity({ ...entry, model_name: undefined })?.family));
   const [family] = families;
-  // A surviving group contains only chat-style rows, because the reducer withholds
-  // every group containing an explicitly incompatible deployment mode.
-  const suppressReasoningContent = aggregateSuppressionEvidence(
-    entries.map((entry) => shouldSuppressRouteReasoningContent(reduced.id, entry)),
+  const hasBackendEvidence = entries.some(hasReadableBackendEvidence);
+  const reasoningPolicy = reduced.semanticModel && hasBackendEvidence ? reduced.reasoningPolicy : undefined;
+  const reasoning = reasoningPolicy?.reasoning ?? reduced.reasoning;
+  // The semantic policy's compat only applies on Chat, so its level map must be
+  // gated the same way. Vendor compatibility is reduced from deployment
+  // evidence; route text is consulted only when no deployment identifies a
+  // family. This gives vanity Kimi routes the complete strict-schema block while
+  // withholding shape-changing fields from mixed or unidentified groups.
+  const unlabeled = reduced.deploymentFamilies.every((family) => family === undefined);
+  const vendorCompat = unlabeled
+    ? buildCompat(reduced.id)
+    : meetVendorCompat(
+        reduced.deploymentFamilies.map((family) =>
+          family === undefined ? undefined : completionsCompat(reduced.id, family),
+        ),
+      );
+  const policy = closeSerializerPolicy({
+    api,
+    reasoning,
+    vendorCompat,
+    semanticCompat: reduced.acceptsResponsesReasoningControl
+      ? { ...reasoningPolicy?.compat, supportsReasoningEffort: true }
+      : reasoningPolicy?.compat,
+    semanticLevels: reasoningPolicy?.thinkingLevelMap,
+    catalogLevels: reduced.thinkingLevelMap,
+    requireChatCarrier: true,
+    // Effort levels require a declared reasoning_effort carrier; public or LiteLLM
+    // level evidence alone does not authorize adding an unsupported request field.
+    allowInferredChatCarrier: false,
+    acceptsResponsesReasoningControl: reduced.acceptsResponsesReasoningControl,
+    denyLevels: options.denyLevels,
+  });
+  const hasConflictingFamily = reduced.deploymentFamilies.includes("conflicting");
+  const unanimousMoonshot =
+    reduced.deploymentFamilies.length > 0 && reduced.deploymentFamilies.every((family) => family === "kimi");
+  const moonshotEvidence =
+    !hasConflictingFamily &&
+    (reduced.deploymentFamilies.includes("kimi") || (unlabeled && isMoonshotModel(reduced.id)));
+  if (moonshotEvidence && !unanimousMoonshot) options.withheldRepairRoutes?.push(reduced.id);
+  const modelPolicy = requestPolicy(
+    reduced.id,
+    reduced.deploymentFamilies,
+    reduced.normalizeThinkTags,
+    reduced.suppressReasoningVisibility,
+    unanimousMoonshot,
   );
   return {
     id: reduced.id,
     // Reduced groups never borrow the ` (no metadata)` sentinel, which authorizes
-    // catalog re-derivation from the model id during offline cache reads. Complete
-    // router pricing does not make catalog-derived capabilities and limits authoritative.
+    // catalog re-derivation from the model id during offline cache reads.
     name: reduced.hasCompleteMetadata ? reduced.id : `${reduced.id} (incomplete metadata)`,
-    reasoning: reduced.reasoning,
-    ...(reduced.thinkingLevelMap ? { thinkingLevelMap: reduced.thinkingLevelMap } : {}),
+    ...policy,
     input: reduced.vision ? ["text", "image"] : ["text"],
     cost: reduced.cost,
     contextWindow: reduced.contextWindow,
     maxTokens: reduced.maxTokens,
-    ...protocol,
-    ...(families.size === 1 && family ? { litellmBackendFamily: family } : {}),
+    api,
     litellmDiscoveryVersion: LITELLM_DISCOVERY_VERSION,
-    ...(suppressReasoningContent ? { suppressReasoningContent: true } : {}),
+    ...(api === "openai-responses" && reduced.acceptsResponsesReasoningControl
+      ? { litellmResponsesReasoningControl: true as const }
+      : {}),
+    ...(families.size === 1 && family ? { litellmBackendFamily: family } : {}),
+    ...(modelPolicy ? { litellmPolicy: modelPolicy } : {}),
   };
 }
 
@@ -528,32 +637,30 @@ function catalogProtocol(modelId: string, catalogModel: Model<Api> | undefined):
     : { api: "openai-completions", compat: completionsCompat(modelId) };
 }
 
-function syntheticHealthRow(route: string): ModelInfoEntry {
-  const catalogModel = findCatalogModel(route);
-  return {
-    model_name: route,
-    // When mixed with deployment details, a bare endpoint contributes only its
-    // catalog-supplied transport and cannot grant catalog metadata to the group.
-    model_info: { mode: catalogModel?.api === "openai-responses" ? "responses" : "chat" },
-  };
-}
-
 function mapFromModelsList(entry: ModelsListEntry): DiscoveredModel | undefined {
   const id = wireString(entry.id);
   if (!id) return undefined;
   const ownedBy = wireString(entry.owned_by);
   const catalogModel = findCatalogModel(id, ownedBy);
+  const api = catalogModel?.api === "openai-responses" ? "openai-responses" : "openai-completions";
   return {
     id,
     name: catalogModel?.name ?? `${id} (no metadata)`,
-    reasoning: catalogModel?.reasoning ?? false,
-    thinkingLevelMap: catalogModel?.thinkingLevelMap,
+    ...closeSerializerPolicy({
+      api,
+      reasoning: catalogModel?.reasoning ?? false,
+      vendorCompat: catalogProtocol(id, catalogModel).compat,
+      catalogLevels: catalogModel?.thinkingLevelMap,
+      requireChatCarrier: true,
+      allowInferredChatCarrier: false,
+    }),
     input: catalogModel?.input ?? ["text"],
     cost: catalogModel?.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: catalogModel?.contextWindow ?? DEFAULT_CONTEXT_WINDOW,
     maxTokens: catalogModel?.maxTokens ?? DEFAULT_MAX_TOKENS,
-    ...catalogProtocol(id, catalogModel),
+    api,
     litellmDiscoveryVersion: LITELLM_DISCOVERY_VERSION,
+    ...(isMoonshotModel(id) ? { litellmPolicy: moonshotPolicy(id) } : {}),
   };
 }
 
@@ -566,66 +673,73 @@ async function discoverFromHealth(
   progress?.("Querying /health endpoint...");
   const healthResult = await fetchJson<HealthResponse>(`${base}/health`, apiKey, options);
   if (!healthResult.ok) return [];
-  const endpoints = (healthResult.data.healthy_endpoints ?? []).filter((entry) => entry.model || entry.model_id);
+  const endpoints = (healthResult.data.healthy_endpoints ?? []).filter((entry) =>
+    Boolean(wireString(entry.model)?.trim() || wireString(entry.model_id)?.trim()),
+  );
   progress?.(`Discovered ${endpoints.length} model endpoints, fetching details...`);
   let completed = 0;
-  const denyThinkingLevels = new Set<ModelInfoEntry>();
-  const syntheticRows = new Set<ModelInfoEntry>();
-  const rows = await Promise.all(
-    endpoints.map(async (endpoint) => {
-      const healthRoute = wireString(endpoint.model);
-      let entry: ModelInfoEntry | undefined;
-      if (endpoint.model_id) {
+  let next = 0;
+  const deployments: (HealthDeployment | undefined)[] = new Array(endpoints.length);
+  const worker = async (): Promise<void> => {
+    while (next < endpoints.length) {
+      const index = next++;
+      const endpoint = endpoints[index];
+      const route = wireString(endpoint.model)?.trim() || undefined;
+      const deploymentId = wireString(endpoint.model_id)?.trim() || undefined;
+      let detail: ModelInfoEntry | undefined;
+      if (deploymentId) {
         const infoResult = await fetchJson<ModelInfoResponse>(
-          `${base}/model/info?litellm_model_id=${encodeURIComponent(endpoint.model_id)}`,
+          `${base}/model/info?litellm_model_id=${encodeURIComponent(deploymentId)}`,
           apiKey,
           options,
         );
-        const detail = infoResult.ok ? infoResult.data.data?.[0] : undefined;
-        if (detail) {
-          if (wireString(detail.model_name)) {
-            entry = detail;
-          } else if (healthRoute) {
-            entry = { ...detail, model_name: healthRoute };
-            denyThinkingLevels.add(entry);
-          }
-        }
-      }
-      if (!entry && healthRoute) {
-        entry = syntheticHealthRow(healthRoute);
-        syntheticRows.add(entry);
+        detail = infoResult.ok ? infoResult.data.data?.[0] : undefined;
       }
       completed++;
       if (completed % 10 === 0 || completed === endpoints.length) {
         progress?.(`Fetched ${completed}/${endpoints.length} models...`);
       }
-      return entry;
-    }),
-  );
-  const groups = new Map<string, ModelInfoEntry[]>();
-  for (const entry of rows) {
-    const route = wireString(entry?.model_name);
-    if (!entry || !route) continue;
+      deployments[index] = healthDeployment(detail, route, deploymentId);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(HEALTH_DETAIL_CONCURRENCY, endpoints.length) }, () => worker()));
+  const groups = new Map<string, HealthDeployment[]>();
+  for (const deployment of deployments) {
+    const route = wireString(deployment?.entry.model_name);
+    if (!deployment || !route) continue;
     const group = groups.get(route) ?? [];
-    group.push(entry);
+    group.push(deployment);
     groups.set(route, group);
   }
-  const publicCatalog = rows.some((entry) => entry && !syntheticRows.has(entry))
+  const publicCatalog = deployments.some((deployment) => deployment && !deployment.synthetic)
     ? await loadDiscoveryPublicCatalog(options)
     : undefined;
   const incompatibleModeRoutes: string[] = [];
-  const models = [...groups.entries()]
-    .map(([route, group]) => {
-      if (hasMixedIncompatibleDeploymentModes(group)) incompatibleModeRoutes.push(route);
-      const model = group.every((entry) => syntheticRows.has(entry))
-        ? mapFromModelsList({ id: route })
-        : mapFromModelInfoGroup(group, publicCatalog);
-      if (model && group.some((entry) => denyThinkingLevels.has(entry))) delete model.thinkingLevelMap;
-      return model;
+  const ambiguousRoutes: string[] = [];
+  const conflictingFamilyRoutes: string[] = [];
+  const withheldRepairRoutes: string[] = [];
+  const discovered = [...groups.values()]
+    .map((group) => {
+      const entries = group.map(({ entry }) => entry);
+      if (hasMixedIncompatibleDeploymentModes(entries)) {
+        const route = wireString(entries[0]?.model_name);
+        if (route) incompatibleModeRoutes.push(route);
+      }
+      if (group.every((deployment) => deployment.synthetic)) return mapFromModelsList({ id: entries[0]!.model_name! });
+      return mapFromModelInfoGroup(entries, publicCatalog, {
+        ambiguousRoutes,
+        conflictingFamilyRoutes,
+        withheldRepairRoutes,
+        denyLevels: group.some(({ denyLevels }) => denyLevels),
+      });
     })
     .filter((model): model is DiscoveredModel => model !== undefined);
   reportIncompatibleDeploymentModes(incompatibleModeRoutes);
-  return models;
+  reportAmbiguousCatalogAuthority(ambiguousRoutes);
+  reportConflictingFamilyEvidence(conflictingFamilyRoutes);
+  reportWithheldToolRepair(withheldRepairRoutes);
+  reportWithheldToolRepairForModels(discovered);
+  return discovered;
 }
 
 function deduplicateModels(models: DiscoveredModel[]): DiscoveredModel[] {
@@ -699,6 +813,7 @@ function applyWildcardEvidence(
   model: DiscoveredModel,
   wildcardRows: readonly ModelInfoEntry[],
   publishedWildcardIds: ReadonlySet<string>,
+  publicCatalog: PublicCatalog | undefined,
 ): DiscoveredModel | undefined {
   const matchingRows = wildcardRows.filter((row) => row.model_name && wildcardMatches(row.model_name, model.id));
   const selectedPattern = matchingRows
@@ -713,61 +828,120 @@ function applyWildcardEvidence(
   const parents = matchingRows
     .filter((row) => row.model_name === selectedPattern)
     .map((row) => resolveWildcardRow(row, model.id));
-  const protocols = parents.map((row) => modelProtocol(model.id, row));
-  const protocol = protocols.find((candidate) => candidate.api === "openai-completions") ?? protocols[0];
-  const families = new Set(parents.map((row) => resolveBackendIdentity({ ...row, model_name: undefined })?.family));
-  const [family] = families;
-  const { litellmBackendFamily: _ignored, ...rest } = model;
+  const selected = mapFromModelInfoGroup(parents, publicCatalog);
+  if (!selected) return undefined;
+  const policies = [model.litellmPolicy, selected.litellmPolicy].filter((policy) => policy !== undefined);
+  const combinedPolicy =
+    policies.length > 0
+      ? {
+          normalizeStrictToolMessages: policies.every((policy) => policy.normalizeStrictToolMessages),
+          normalizeThinkTags: policies.every((policy) => policy.normalizeThinkTags),
+          suppressReasoningVisibility: policies.every((policy) => policy.suppressReasoningVisibility),
+          ...(policies.every((policy) => policy.normalizeGeminiReasoningEffort)
+            ? { normalizeGeminiReasoningEffort: true as const }
+            : {}),
+        }
+      : undefined;
+  const {
+    litellmBackendFamily: _family,
+    litellmResponsesReasoningControl: _control,
+    litellmPolicy: _policy,
+    thinkingLevelMap: _levels,
+    ...rest
+  } = model;
   return {
     ...rest,
-    ...protocol,
-    ...(families.size === 1 && family ? { litellmBackendFamily: family } : {}),
+    api: selected.api,
+    reasoning: selected.reasoning,
+    compat: selected.compat,
+    ...(selected.thinkingLevelMap ? { thinkingLevelMap: selected.thinkingLevelMap } : {}),
+    ...(selected.litellmBackendFamily ? { litellmBackendFamily: selected.litellmBackendFamily } : {}),
+    ...(combinedPolicy ? { litellmPolicy: combinedPolicy } : {}),
+    ...(selected.litellmResponsesReasoningControl ? { litellmResponsesReasoningControl: true as const } : {}),
   };
 }
 
 function mapFromWildcardExpansion(
   entry: ModelsListEntry,
-  wildcards: readonly DiscoveredModel[],
+  wildcards: readonly WildcardExpansionSource[],
+  withheldRepairRoutes?: string[],
 ): DiscoveredModel | undefined {
   const id = wireString(entry.id);
   if (!id || id.includes("*")) return undefined;
-  const matches = wildcards.filter((model) => wildcardMatches(model.id, id));
-  if (matches.length === 0) return undefined;
-
+  const matchingSources = wildcards.filter(({ model }) => wildcardMatches(model.id, id));
+  if (matchingSources.length === 0) return undefined;
+  const matches = matchingSources.map(({ model }) => model);
   const api = matches.every((model) => model.api === "openai-responses") ? "openai-responses" : "openai-completions";
   const reasoning = matches.every((model) => model.reasoning);
-  const vision = matches.every((model) => model.input.includes("image"));
-  const contextWindow = Math.min(...matches.map((model) => model.contextWindow));
-  const maxTokens = Math.min(...matches.map((model) => model.maxTokens));
   const thinkingLevelMap = reasoning
     ? intersectThinkingLevelMaps(matches.map((model) => model.thinkingLevelMap))
     : undefined;
-  const incomplete = matches.some((model) => model.name.endsWith(" (incomplete metadata)"));
-  const suppressReasoningContent =
-    !FORCED_THINKING_MODEL_PATTERN.test(id) &&
-    aggregateSuppressionEvidence(matches.map((model) => model.suppressReasoningContent === true));
+  const hasFamilyEvidence = matchingSources.some(({ deploymentFamilies }) =>
+    deploymentFamilies.some((family) => family !== undefined),
+  );
+  const vendorCompat = hasFamilyEvidence ? meetVendorCompat(matches.map((model) => model.compat)) : buildCompat(id);
+  const modelPolicies = matches.map((model) => model.litellmPolicy);
+  const hasModelPolicy = modelPolicies.some((policy) => policy !== undefined);
+  const modelPolicy = hasModelPolicy
+    ? {
+        normalizeStrictToolMessages: modelPolicies.every((policy) => policy?.normalizeStrictToolMessages === true),
+        normalizeThinkTags:
+          !FORCED_THINKING_MODEL_PATTERN.test(id) &&
+          modelPolicies.every((policy) => policy?.normalizeThinkTags === true),
+        suppressReasoningVisibility:
+          !FORCED_THINKING_MODEL_PATTERN.test(id) &&
+          modelPolicies.every((policy) => policy?.suppressReasoningVisibility === true),
+        ...(modelPolicies.every((policy) => policy?.normalizeGeminiReasoningEffort === true)
+          ? { normalizeGeminiReasoningEffort: true as const }
+          : {}),
+      }
+    : !hasFamilyEvidence && isMoonshotModel(id)
+      ? moonshotPolicy(id)
+      : undefined;
+  const policy = closeSerializerPolicy({
+    api,
+    reasoning,
+    vendorCompat,
+    catalogLevels: thinkingLevelMap,
+    requireChatCarrier: true,
+    allowInferredChatCarrier: false,
+    acceptsResponsesReasoningControl:
+      api === "openai-responses" && matches.every((model) => model.litellmResponsesReasoningControl === true),
+  });
+  const hasKimiEvidence = matchingSources.some(({ deploymentFamilies }) => deploymentFamilies.includes("kimi"));
+  const routeOnlyMoonshot = !hasFamilyEvidence && isMoonshotModel(id);
+  if (modelPolicy?.normalizeStrictToolMessages === false && (hasKimiEvidence || routeOnlyMoonshot)) {
+    withheldRepairRoutes?.push(id);
+  }
+  // A concrete /v1/models id may enrich presentation only. It never contributes
+  // reasoning levels, compatibility carriers, or request policy to the child.
+  const catalogModel = findCatalogModel(id, wireString(entry.owned_by));
+  const parentIncomplete = matches.some((model) => model.name.endsWith(" (incomplete metadata)"));
+  const base = catalogModel?.name ?? id;
   // Preserve every known tier even when a sibling has incomplete metadata. Omitting
   // a complete sibling's higher tier would understate the known worst-case rate;
   // the incomplete marker continues to signal that the resulting envelope is partial.
-  const costTiers = conservativeCostTiers(matches.map((model) => model.cost));
+  const tiers = conservativeCostTiers(matches.map((model) => model.cost));
   return {
     id,
-    name: incomplete ? `${id} (incomplete metadata)` : id,
-    reasoning,
-    ...(thinkingLevelMap ? { thinkingLevelMap } : {}),
-    input: vision ? ["text", "image"] : ["text"],
+    name: parentIncomplete ? `${base} (incomplete metadata)` : base,
+    ...policy,
+    input: matches.every((model) => model.input.includes("image")) ? ["text", "image"] : ["text"],
     cost: {
       input: Math.max(...matches.map((model) => model.cost.input)),
       output: Math.max(...matches.map((model) => model.cost.output)),
       cacheRead: Math.max(...matches.map((model) => model.cost.cacheRead)),
       cacheWrite: Math.max(...matches.map((model) => model.cost.cacheWrite)),
-      ...(costTiers ? { tiers: costTiers } : {}),
+      ...(tiers ? { tiers } : {}),
     },
-    contextWindow,
-    maxTokens,
-    ...(api === "openai-responses" ? { api, compat: responsesCompat(id) } : { api, compat: completionsCompat(id) }),
+    contextWindow: Math.min(...matches.map((model) => model.contextWindow)),
+    maxTokens: Math.min(...matches.map((model) => model.maxTokens)),
+    api,
     litellmDiscoveryVersion: LITELLM_DISCOVERY_VERSION,
-    ...(suppressReasoningContent ? { suppressReasoningContent: true } : {}),
+    ...(api === "openai-responses" && matches.every((model) => model.litellmResponsesReasoningControl === true)
+      ? { litellmResponsesReasoningControl: true as const }
+      : {}),
+    ...(modelPolicy ? { litellmPolicy: modelPolicy } : {}),
   };
 }
 
@@ -793,11 +967,18 @@ export async function discoverModels(
     const publicCatalog = await loadDiscoveryPublicCatalog(options);
     const ambiguousRoutes: string[] = [];
     const incompatibleModeRoutes: string[] = [];
+    const conflictingFamilyRoutes: string[] = [];
+    const withheldRepairRoutes: string[] = [];
     const reducedGroups = [...groups.entries()].map(([route, group]) => {
       if (hasMixedIncompatibleDeploymentModes(group)) incompatibleModeRoutes.push(route);
       return {
         route,
-        model: mapFromModelInfoGroup(group, publicCatalog, ambiguousRoutes),
+        model: mapFromModelInfoGroup(group, publicCatalog, {
+          ambiguousRoutes,
+          conflictingFamilyRoutes,
+          withheldRepairRoutes,
+        }),
+        deploymentFamilies: group.map(deploymentFamily),
       };
     });
     let models = reducedGroups
@@ -805,6 +986,8 @@ export async function discoverModels(
       .filter((model): model is DiscoveredModel => model !== undefined);
     reportIncompatibleDeploymentModes(incompatibleModeRoutes);
     reportAmbiguousCatalogAuthority(ambiguousRoutes);
+    reportConflictingFamilyEvidence(conflictingFamilyRoutes);
+    reportWithheldToolRepair(withheldRepairRoutes);
     // LiteLLM's /model/info does NOT expand wildcard model_name entries (e.g.
     // "lemonade/*" backed by model: openai/* + check_provider_endpoint: true)
     // — it returns the literal wildcard only. The discovered ids live in
@@ -815,11 +998,11 @@ export async function discoverModels(
     const wildcardRoutes = reducedGroups.filter(({ route }) => route.includes("*"));
     if (wildcardRoutes.length > 0) {
       const wildcards = wildcardRoutes
-        .map(({ model }) => model)
-        .filter((model): model is DiscoveredModel => model !== undefined);
+        .filter((source): source is typeof source & { model: DiscoveredModel } => source.model !== undefined)
+        .map(({ model, deploymentFamilies }) => ({ model, deploymentFamilies }));
       const droppedRoutes = reducedGroups.filter(({ model }) => model === undefined).map(({ route }) => route);
       const wildcardRows = wildcardRoutes.flatMap(({ route }) => groups.get(route)!);
-      const publishedWildcardIds = new Set(wildcards.map((model) => model.id));
+      const publishedWildcardIds = new Set(wildcards.map(({ model }) => model.id));
       // Exact exclusions are bounded to the same public id: `/v1/models` lacks
       // deployment identity, so a differently named id for that deployment is unknowable.
       const droppedExactIds = new Set(droppedRoutes.filter((route) => !route.includes("*")));
@@ -830,22 +1013,25 @@ export async function discoverModels(
       progress?.("/model/info has wildcard entries, expanding via /v1/models...");
       const listResult = await fetchJson<ModelsListResponse>(`${base}/v1/models`, apiKey, options);
       if (listResult.ok && wildcards.length > 0) {
+        const seen = new Set(models.map((model) => model.id));
         const expanded = (listResult.data.data ?? [])
           .filter((entry) => {
             const id = wireString(entry.id);
             return (
               id === undefined ||
-              (!droppedExactIds.has(id) && !droppedWildcards.some((route) => wildcardMatches(route, id)))
+              (!seen.has(id) &&
+                !droppedExactIds.has(id) &&
+                !droppedWildcards.some((route) => wildcardMatches(route, id)))
             );
           })
-          .map((entry) => mapFromWildcardExpansion(entry, wildcards))
+          .map((entry) => mapFromWildcardExpansion(entry, wildcards, withheldRepairRoutes))
           .filter((model): model is DiscoveredModel => model !== undefined)
-          .map((model) => applyWildcardEvidence(model, wildcardRows, publishedWildcardIds))
+          .map((model) => applyWildcardEvidence(model, wildcardRows, publishedWildcardIds, publicCatalog))
           .filter((model): model is DiscoveredModel => model !== undefined);
-        const seen = new Set<string>(models.map((m) => m.id));
-        models = [...models, ...expanded.filter((m) => !seen.has(m.id))];
+        models = [...models, ...expanded];
       }
     }
+    reportWithheldToolRepair(withheldRepairRoutes);
     return { source: "model_info", models: deduplicateModels(models) };
   }
   if (![401, 403, 404].includes(infoResult.status)) {
@@ -865,4 +1051,203 @@ export async function discoverModels(
     .map(mapFromModelsList)
     .filter((m): m is DiscoveredModel => m !== undefined);
   return { source: "models_list", models: deduplicateModels(models) };
+}
+
+export function moonshotPolicy(modelId: string, strictToolRepair = false): LiteLLMModelPolicy {
+  return {
+    normalizeStrictToolMessages: strictToolRepair,
+    normalizeThinkTags: !FORCED_THINKING_MODEL_PATTERN.test(modelId),
+    // Route-only fallback cannot authorize request-side reasoning suppression.
+    suppressReasoningVisibility: false,
+  };
+}
+
+function requestPolicy(
+  modelId: string,
+  deploymentFamilies: readonly CatalogResolution["semanticFamily"][],
+  normalizeThinkTags: boolean,
+  suppressReasoningVisibility: boolean,
+  strictToolRepair: boolean,
+): LiteLLMModelPolicy | undefined {
+  // A contradiction within one deployment is evidence against applying any
+  // family-specific request policy; do not discard it like a missing label.
+  if (deploymentFamilies.includes("conflicting")) return undefined;
+  const evidenced = deploymentFamilies.filter((family) => family !== undefined);
+  if (evidenced.length === deploymentFamilies.length && evidenced.every((family) => family === "gemini")) {
+    return {
+      normalizeStrictToolMessages: false,
+      normalizeThinkTags: false,
+      suppressReasoningVisibility: false,
+      normalizeGeminiReasoningEffort: true,
+    };
+  }
+  if (evidenced.includes("kimi")) {
+    return {
+      normalizeStrictToolMessages: strictToolRepair,
+      normalizeThinkTags,
+      suppressReasoningVisibility,
+    };
+  }
+  if (evidenced.length === 0 && isMoonshotModel(modelId)) return moonshotPolicy(modelId);
+  return undefined;
+}
+
+function hasMoonshotCompatEvidence(compat: Model<Api>["compat"]): boolean {
+  const openAICompat = compat as Model<"openai-completions">["compat"];
+  return openAICompat?.maxTokensField === "max_tokens" && openAICompat.supportsStrictMode === false;
+}
+
+export function restoreCachedModelPolicy(model: Model<Api>): Model<Api> {
+  const cached = model as Model<Api> & { litellmPolicy?: LiteLLMModelPolicy };
+  if (cached.litellmPolicy || !hasMoonshotCompatEvidence(model.compat)) return model;
+  const restored: typeof cached = { ...cached, litellmPolicy: moonshotPolicy(model.id) };
+  return restored;
+}
+
+function hasResponsesReasoningControl(model: Model<Api>): boolean {
+  return (
+    (model as Model<Api> & Pick<DiscoveredModel, "litellmResponsesReasoningControl">)
+      .litellmResponsesReasoningControl === true
+  );
+}
+
+function semanticModel(id: string): SemanticModel | undefined {
+  const value = resolveBackendIdentity({ litellm_params: { model: id } })?.modelId.toLowerCase() ?? "";
+  if (/(?:^|[./_-])kimi[-_/]?k?2[._-]?[56](?:$|[./_:-])/.test(value)) return "kimi-k2.5-k2.6";
+  if (/(?:^|[./_-])kimi[-_/]?k?2[._-]?7[./_-]?(?:code|highspeed)(?:$|[./_:-])/.test(value)) {
+    return "kimi-k2.7-code";
+  }
+  if (/(?:^|[./_-])kimi[-_/]?k?3(?:$|[./_:-])/.test(value)) return "kimi-k3";
+  if (/(?:^|[./_-])deepseek[-_/]?v?4(?:$|[./_:-])/.test(value)) return "deepseek-v4";
+  return undefined;
+}
+
+function semanticFamily(id: string): SemanticFamily | undefined {
+  return resolveBackendIdentity({ litellm_params: { model: id } })?.family;
+}
+
+function deploymentFamily(entry: ModelInfoEntry): CatalogResolution["semanticFamily"] {
+  if (
+    (wireString(entry.litellm_params?.model) || wireString(entry.model_info?.base_model)) &&
+    !resolveBackendIdentity({ ...entry, model_name: undefined })
+  )
+    return "conflicting";
+  const identityFamilies = [
+    entry.litellm_params?.model,
+    entry.litellm_params?.custom_llm_provider,
+    entry.model_info?.base_model,
+  ]
+    .map((candidate) => wireString(candidate)?.trim())
+    .filter((candidate): candidate is string => Boolean(candidate))
+    .map(semanticFamily)
+    .filter((family): family is SemanticFamily => family !== undefined);
+  const distinctIdentityFamilies = new Set(identityFamilies);
+  if (distinctIdentityFamilies.size > 1) return "conflicting";
+
+  const identityFamily = identityFamilies[0];
+  const adapter = wireString(entry.model_info?.litellm_provider)?.trim().toLowerCase();
+  const adapterFamily = adapter
+    ? GENERIC_TRANSPORT_ADAPTERS.has(adapter)
+      ? "openai"
+      : semanticFamily(adapter)
+    : undefined;
+  if (!identityFamily) return adapterFamily;
+  // OpenAI-compatible and Azure adapters describe transport, not the backend
+  // vendor. They remain useful fallback evidence for opaque identities, but must
+  // not contradict a model/base identity such as `openai/kimi-k2.5`.
+  if (!adapterFamily || (adapter && GENERIC_TRANSPORT_ADAPTERS.has(adapter))) return identityFamily;
+  return adapterFamily === identityFamily ? identityFamily : "conflicting";
+}
+
+function reportConflictingFamilyEvidence(routes: readonly string[]): void {
+  reportBoundedRoutes(
+    reportedConflictingFamilyRoutes,
+    routes,
+    (count) =>
+      `LiteLLM discovery: ${count} route group(s) have conflicting deployment family evidence; ` +
+      "family-specific compatibility and request policy are withheld",
+  );
+}
+
+function reportWithheldToolRepair(routes: readonly string[]): void {
+  reportBoundedRoutes(
+    reportedWithheldRepairRoutes,
+    routes,
+    (count) =>
+      `LiteLLM discovery: ${count} route group(s) look Moonshot-backed but not every deployment evidences it; ` +
+      "strict tool-message repair is withheld because it rewrites outbound messages and is unproven for a " +
+      "deployment that has not identified its backend. Moonshot tool calls on these routes may fail until every " +
+      "deployment declares its backend",
+  );
+}
+
+function reportWithheldToolRepairForModels(models: readonly DiscoveredModel[]): void {
+  reportWithheldToolRepair(
+    models
+      .filter(
+        (model) =>
+          model.litellmPolicy?.normalizeStrictToolMessages === false &&
+          model.litellmPolicy.normalizeGeminiReasoningEffort !== true,
+      )
+      .map((model) => model.id),
+  );
+}
+
+function hasReadableBackendEvidence(entry: ModelInfoEntry): boolean {
+  return [
+    entry.litellm_params?.model,
+    entry.litellm_params?.custom_llm_provider,
+    entry.model_info?.base_model,
+    entry.model_info?.litellm_provider,
+  ].some((candidate) => Boolean(wireString(candidate)?.trim()));
+}
+
+function healthDeployment(
+  detail: ModelInfoEntry | undefined,
+  fallbackRoute: string | undefined,
+  deploymentId: string | undefined,
+): HealthDeployment | undefined {
+  const detailRoute = wireString(detail?.model_name)?.trim() || undefined;
+  // /health exposes backend litellm_params.model values. Correlated detail owns
+  // the public model_name; the health value is only a fallback when detail lacks it.
+  const route = detailRoute || fallbackRoute?.trim();
+  if (!route) return undefined;
+  if (!detail) {
+    return {
+      entry: {
+        model_name: route,
+        model_info: {
+          ...(deploymentId ? { id: deploymentId } : {}),
+          mode: findCatalogModel(route)?.api === "openai-responses" ? "responses" : "chat",
+        },
+      },
+      // The route name authorizes nothing but transport, which the Pi catalog
+      // supplies for this evidence-free entry. Levels stay denied and no catalog
+      // metadata is granted.
+      denyLevels: true,
+      synthetic: true,
+    };
+  }
+  return {
+    entry: {
+      ...detail,
+      model_name: route,
+      model_info: {
+        ...detail.model_info,
+        ...(wireString(detail.model_info?.id)?.trim() ? {} : deploymentId ? { id: deploymentId } : {}),
+      },
+    },
+    // Detail without a public route cannot authorize selectable levels.
+    denyLevels: detailRoute === undefined,
+    synthetic: false,
+  };
+}
+
+function aggregateSuppressionEvidence(evidence: Iterable<boolean>): boolean {
+  let hasEvidence = false;
+  for (const suppress of evidence) {
+    hasEvidence = true;
+    if (!suppress) return false;
+  }
+  return hasEvidence;
 }

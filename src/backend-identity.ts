@@ -16,6 +16,7 @@ export interface BackendIdentity {
 }
 
 const GENERIC_ADAPTERS = new Set(["azure", "azure_ai", "custom_openai", "openai_like"]);
+const GENERIC_CATALOG_PROVIDERS = new Set([...GENERIC_ADAPTERS, "openai", "text-completion-openai"]);
 // Providers whose name alone settles the family. `openai` is deliberately absent: LiteLLM
 // uses that provider for any OpenAI-compatible server, so it says nothing about the model.
 const PROVIDER_FAMILIES: Readonly<Record<string, BackendFamily>> = {
@@ -32,6 +33,10 @@ const KNOWN_VENDOR_PREFIXES = new Set([...Object.keys(PROVIDER_FAMILIES), "opena
 // right after a provider path segment — an interior "-o1-" is as likely to be an unrelated
 // product's own version marker (e.g. "custom-o1-clone").
 const OPENAI_FAMILY_PATTERN = /(?:^|[./_-])(?:openai|gpt|codex)(?:$|[./_:-])|(?:^|\/)o\d(?:$|[./_:-])/i;
+
+export function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
 
 function wireString(value: unknown): string | undefined {
   const trimmed = typeof value === "string" ? value.trim() : undefined;
@@ -79,4 +84,17 @@ export function resolveBackendIdentity(row: BackendIdentityRow): BackendIdentity
     qualifiedId: provider ? `${provider}/${modelId}` : modelId,
     ...(family ? { family } : {}),
   };
+}
+
+export function resolveCatalogProvider(
+  row: BackendIdentityRow,
+  identity = resolveBackendIdentity(row),
+): string | undefined {
+  if (identity?.provider && !GENERIC_CATALOG_PROVIDERS.has(identity.provider)) return identity.provider;
+  const reported = wireString(row.model_info?.litellm_provider)?.toLowerCase();
+  const custom = wireString(row.litellm_params?.custom_llm_provider)?.toLowerCase();
+  if (custom && reported && GENERIC_CATALOG_PROVIDERS.has(reported)) {
+    return custom;
+  }
+  return identity?.provider ?? reported ?? custom;
 }

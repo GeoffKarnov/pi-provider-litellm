@@ -9,7 +9,7 @@ import {
   type SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
 import { LITELLM_DISCOVERY_VERSION } from "./backend-identity.js";
-import { enrichCachedModel, normalizeBaseUrl } from "./discover.js";
+import { enrichCachedModel, normalizeBaseUrl, restoreCachedModelPolicy } from "./discover.js";
 import { createLiteLLMProtocolApis, isLiteLLMApi, LITELLM_API_NAMES, resolveModelBaseUrl } from "./protocols.js";
 import type { DiscoveredModel, DiscoveryResult, LiteLLMApi, LiteLLMModel } from "./types.js";
 
@@ -223,7 +223,7 @@ export function createLiteLLMProvider(options: LiteLLMProviderOptions): Provider
       const models = storedModels.map((model) => {
         if ((model as LiteLLMModel).litellmDiscoveryVersion !== LITELLM_DISCOVERY_VERSION) {
           legacyCount++;
-          return model;
+          return restoreCachedModelPolicy(model);
         }
         return enrichCachedModel(model);
       });

@@ -5,8 +5,8 @@ export const THINKING_LEVEL_DEFINITIONS = [
   ["off", "none", "supports_none_reasoning_effort"],
   ["minimal", "minimal", "supports_minimal_reasoning_effort"],
   ["low", "low", "supports_low_reasoning_effort"],
-  ["medium", "medium", "supports_medium_reasoning_effort"],
-  ["high", "high", "supports_high_reasoning_effort"],
+  ["medium", "medium", undefined],
+  ["high", "high", undefined],
   ["xhigh", "xhigh", "supports_xhigh_reasoning_effort"],
   ["max", "max", "supports_max_reasoning_effort"],
 ] as const;
