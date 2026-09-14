@@ -1572,6 +1572,8 @@ describe("extension startup", () => {
       response_types: ["code"],
     });
     expect(authorizationUrl?.searchParams.get("resource")).toBe("https://litellm.example.com");
+    expect(authorizationUrl?.searchParams.get("tenant")).toBe("alpha");
+    expect(authorizationUrl?.searchParams.getAll("client_id")).toEqual(["llm_dcrc_client"]);
     const verifier = tokenForm?.get("code_verifier");
     expect(verifier).toEqual(expect.any(String));
     expect(
@@ -1645,12 +1647,31 @@ describe("extension startup", () => {
     expect(fetchMock.mock.calls.some(([input]) => String(input).endsWith("/register"))).toBe(false);
   });
 
-  it("does not follow PKCE discovery redirects", async () => {
+  it.each([
+    "https://secret@proxy.example.com",
+    "https://proxy.example.com?tenant=other",
+    "https://proxy.example.com#fragment",
+  ])("rejects an invalid PKCE proxy URL before discovery: %s", async (baseUrl) => {
+    process.env.LITELLM_DISCOVERY_TIMEOUT_MS = "0";
+    const extension = await loadExtension(await makeAgentDir());
+    const pi = createPi();
+    await extension(pi);
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse(404, {}));
+    await expect(
+      loginOAuth(pi.providers[0]!, {
+        onPrompt: async (prompt) => (prompt.placeholder ? baseUrl : ""),
+        pkce: true,
+      }),
+    ).rejects.toThrow();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it.each([302, 200])("rejects invalid PKCE discovery responses (HTTP %s)", async (status) => {
     const agentDir = await makeAgentDir();
     process.env.LITELLM_DISCOVERY_TIMEOUT_MS = "0";
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
-      new Response(null, {
-        status: 302,
+      new Response("untrusted-secret", {
+        status,
         headers: { location: "https://other.example.com/.well-known/litellm-cli-auth" },
       }),
     );
@@ -1664,7 +1685,11 @@ describe("extension startup", () => {
         pkce: true,
         signal: new AbortController().signal,
       }),
-    ).rejects.toThrow("LiteLLM CLI auth discovery failed (HTTP 302)");
+    ).rejects.toThrow(
+      status === 302
+        ? "LiteLLM CLI auth discovery failed (HTTP 302)"
+        : "LiteLLM CLI auth discovery returned invalid JSON",
+    );
     expect(fetchMock.mock.calls[0]?.[1]?.redirect).toBe("manual");
   });
 
@@ -1679,7 +1704,7 @@ describe("extension startup", () => {
         return jsonResponse(200, {
           contract_version: 1,
           issuer: "https://litellm.example.com",
-          authorization_endpoint: "https://litellm.example.com/authorize",
+          authorization_endpoint: "https://litellm.example.com/authorize?tenant=alpha&client_id=wrong",
           token_endpoint: "https://litellm.example.com/token",
           registration_endpoint: "https://litellm.example.com/register",
           resource: "https://litellm.example.com",
@@ -1780,7 +1805,11 @@ describe("extension startup", () => {
     ).rejects.toThrow("LiteLLM PKCE login was denied");
   });
 
-  it.each(["registration", "token"])("does not follow native PKCE %s redirects", async (stage) => {
+  it.each([
+    ["registration", "redirect"],
+    ["token", "redirect"],
+    ["registration", "invalid JSON"],
+  ])("rejects native PKCE %s %s", async (stage, failure) => {
     const agentDir = await makeAgentDir();
     process.env.LITELLM_DISCOVERY_TIMEOUT_MS = "0";
     const nativeFetch = globalThis.fetch;
@@ -1801,7 +1830,10 @@ describe("extension startup", () => {
       if (url.endsWith("/register")) {
         redirects.push(init?.redirect ?? "follow");
         if (stage === "registration")
-          return new Response(null, { status: 302, headers: { location: "/register-next" } });
+          return new Response("untrusted-secret", {
+            status: failure === "redirect" ? 302 : 200,
+            headers: { location: "/register-next" },
+          });
         return jsonResponse(200, {
           client_id: "llm_dcrc_client",
           redirect_uris: JSON.parse(String(init?.body)).redirect_uris,
@@ -1830,7 +1862,11 @@ describe("extension startup", () => {
         signal: new AbortController().signal,
       }),
     ).rejects.toThrow(
-      stage === "registration" ? "client registration failed (HTTP 302)" : "token exchange failed (HTTP 302)",
+      failure === "invalid JSON"
+        ? "LiteLLM CLI auth registration returned invalid JSON"
+        : stage === "registration"
+          ? "client registration failed (HTTP 302)"
+          : "token exchange failed (HTTP 302)",
     );
     expect(redirects).toEqual(stage === "registration" ? ["manual"] : ["manual", "manual"]);
   });
@@ -1881,14 +1917,17 @@ describe("extension startup", () => {
 
   it.each<[string, number, unknown, string]>([
     ["a malformed response", 200, {}, "LiteLLM token exchange returned an invalid response"],
-    ...[{ access_token: " " }, { refresh_token: "refresh\nsecret" }, { expires_in: 1e308 }].map(
-      (override): [string, number, unknown, string] => [
-        `an invalid ${Object.keys(override)[0]}`,
-        200,
-        { access_token: "access", refresh_token: "refresh", token_type: "Bearer", expires_in: 3600, ...override },
-        "LiteLLM token exchange returned an invalid response",
-      ],
-    ),
+    ...[
+      { access_token: " " },
+      { refresh_token: "refresh\nsecret" },
+      { expires_in: 1e308 },
+      { expires_in: { toString: null } },
+    ].map((override): [string, number, unknown, string] => [
+      `an invalid ${Object.keys(override)[0]}`,
+      200,
+      { access_token: "access", refresh_token: "refresh", token_type: "Bearer", expires_in: 3600, ...override },
+      "LiteLLM token exchange returned an invalid response",
+    ]),
     [
       "an OAuth error",
       400,

@@ -609,7 +609,8 @@ function sameOriginUrl(value: unknown, issuer: URL, field: string): string {
   } catch {
     throw new Error(`LiteLLM CLI auth discovery has invalid ${field}`);
   }
-  if (url.origin !== issuer.origin) throw new Error(`LiteLLM CLI auth discovery has cross-origin ${field}`);
+  if (url.protocol !== issuer.protocol || url.origin !== issuer.origin)
+    throw new Error(`LiteLLM CLI auth discovery has cross-origin ${field}`);
   if (url.username || url.password || url.hash) throw new Error(`LiteLLM CLI auth discovery has invalid ${field}`);
   return value.trim();
 }
@@ -618,11 +619,21 @@ function isAuthToken(value: unknown): value is string {
   return typeof value === "string" && /^[\x21-\x7e]+$/.test(value);
 }
 
+async function readAuthJson(response: Response, signal: AbortSignal | undefined, stage: string): Promise<unknown> {
+  try {
+    return await response.json();
+  } catch {
+    if (signal?.aborted) throw signal.reason;
+    throw new Error(`LiteLLM CLI auth ${stage} returned invalid JSON`);
+  }
+}
+
 async function discoverPkce(
   baseUrl: string,
   signal?: AbortSignal,
   headers?: Record<string, string>,
 ): Promise<CliAuthDiscovery | undefined> {
+  canonicalIssuer(baseUrl);
   const response = await fetch(`${baseUrl}${CLI_AUTH_DISCOVERY_PATH}`, {
     headers: authRequestHeaders(headers),
     redirect: "manual",
@@ -630,7 +641,7 @@ async function discoverPkce(
   });
   if (response.status === 404) return undefined;
   if (!response.ok) throw new Error(`LiteLLM CLI auth discovery failed (HTTP ${response.status})`);
-  const data = (await response.json()) as unknown;
+  const data = await readAuthJson(response, signal, "discovery");
   if (!isPlainObject(data) || data.contract_version !== 1)
     throw new Error("LiteLLM CLI auth discovery has unsupported contract version");
   if (!Array.isArray(data.code_challenge_methods_supported) || !data.code_challenge_methods_supported.includes("S256"))
@@ -694,7 +705,7 @@ async function requestPkceToken(
           : `LiteLLM token exchange failed (HTTP ${response.status})`,
     };
   }
-  const expires = Date.now() + Number(data?.expires_in) * 1_000;
+  const expires = typeof data?.expires_in === "number" ? Date.now() + data.expires_in * 1_000 : NaN;
   if (
     !isAuthToken(data?.access_token) ||
     !isAuthToken(data.refresh_token) ||
@@ -795,7 +806,7 @@ async function loginPkce(
     });
     if (!registrationResponse.ok)
       throw new Error(`LiteLLM PKCE client registration failed (HTTP ${registrationResponse.status})`);
-    const registration = (await registrationResponse.json()) as unknown;
+    const registration = await readAuthJson(registrationResponse, interaction.signal, "registration");
     if (
       !isPlainObject(registration) ||
       !isAuthToken(registration.client_id) ||
@@ -805,7 +816,7 @@ async function loginPkce(
       throw new Error("LiteLLM PKCE client registration returned an invalid response");
     }
     const authorizationUrl = new URL(discovery.authorizationEndpoint);
-    authorizationUrl.search = new URLSearchParams({
+    for (const [key, value] of Object.entries({
       client_id: registration.client_id,
       redirect_uri: redirectUri,
       response_type: "code",
@@ -813,7 +824,8 @@ async function loginPkce(
       code_challenge: createHash("sha256").update(verifier).digest("base64url"),
       code_challenge_method: "S256",
       state,
-    }).toString();
+    }))
+      authorizationUrl.searchParams.set(key, value);
     interaction.notify({
       type: "auth_url",
       url: authorizationUrl.toString(),
