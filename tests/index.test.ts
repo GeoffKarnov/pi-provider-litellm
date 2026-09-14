@@ -1597,7 +1597,9 @@ describe("extension startup", () => {
             }),
       );
       const results = await Promise.all([models.getAuth("litellm"), models.getAuth("litellm")]);
-      expect(fetchMock).toHaveBeenCalledTimes(transient ? 2 : 1);
+      // A transient failure backs off instead of letting the second, lock-serialized
+      // caller immediately retry against the still-failing token endpoint.
+      expect(fetchMock).toHaveBeenCalledTimes(1);
       const access = transient ? "access-old" : "access-new";
       expect(results.map((result) => result?.auth.apiKey)).toEqual([access, access]);
       expect(await credentials.read("litellm")).toMatchObject({

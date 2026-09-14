@@ -55,6 +55,7 @@ const DEFAULT_CLI_JWT_EXPIRATION_HOURS = 24;
 const TOKEN_REFRESH_LEAD_MS = 5 * 60 * 1000;
 const PERMANENT_TOKEN_EXPIRES_AT = Number.MAX_SAFE_INTEGER;
 const EXPIRE_TOKEN_IMMEDIATELY = 0;
+const PKCE_TRANSIENT_REFRESH_BACKOFF_MS = 5_000;
 
 type RawProviderSettings = {
   displayName?: unknown;
@@ -1056,6 +1057,11 @@ async function loginOAuth(interaction: AuthInteraction, definition: ProviderDefi
   };
 }
 
+// Keyed by provider name: how long to skip re-attempting a refresh after a transient
+// failure, so callers serialized behind Pi's credential lock don't each fire another
+// request at the still-failing token endpoint (e.g. during an outage or rate limit).
+const pkceTransientRefreshBackoff = new Map<string, number>();
+
 async function refreshLiteLLM(
   credentials: OAuthCredentials,
   definition: ProviderDefinition,
@@ -1071,6 +1077,10 @@ async function refreshLiteLLM(
       !Number.isSafeInteger(credentials.expires)
     ) {
       throw new Error("Invalid LiteLLM PKCE credential; run /login litellm again");
+    }
+    if (Date.now() < credentials.expires) {
+      const backoffUntil = pkceTransientRefreshBackoff.get(definition.name);
+      if (backoffUntil !== undefined && Date.now() < backoffUntil) return credentials;
     }
     const baseUrl = requireCredentialRoot(
       normalizeBaseUrl(credentials.baseUrl, definition.allowInsecureHttp),
@@ -1093,9 +1103,13 @@ async function refreshLiteLLM(
       credentials.refresh,
     );
     if (!result.ok) {
-      if (result.transient && Date.now() < credentials.expires) return credentials;
+      if (result.transient && Date.now() < credentials.expires) {
+        pkceTransientRefreshBackoff.set(definition.name, Date.now() + PKCE_TRANSIENT_REFRESH_BACKOFF_MS);
+        return credentials;
+      }
       throw new Error(`${result.message}; run /login litellm again`);
     }
+    pkceTransientRefreshBackoff.delete(definition.name);
     return { ...credentials, ...result.token };
   }
   if (!credentials.refresh.startsWith("!")) {
