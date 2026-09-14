@@ -1170,11 +1170,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     if (!auth) return undefined;
     const provider = ctx.modelRegistry.getProvider(PROVIDER_NAME);
     const apiKey = auth.auth.apiKey;
-    const oauthRuntimeRoot = oauthRuntimeRoots.get(PROVIDER_NAME);
-    const baseUrl =
-      cleanConfig(auth.env?.[ENV_BASE_URL]) ??
-      (oauthRuntimeRoot && oauthRuntimeRoot.apiKey === apiKey ? oauthRuntimeRoot.root : undefined) ??
-      provider?.baseUrl;
+    const baseUrl = cleanConfig(auth.auth.baseUrl) ?? cleanConfig(auth.env?.[ENV_BASE_URL]) ?? provider?.baseUrl;
     if (!baseUrl || !apiKey) return undefined;
     const runtimeRoot = requireCredentialRoot(
       normalizeBaseUrl(baseUrl, definitions[0]?.allowInsecureHttp),
