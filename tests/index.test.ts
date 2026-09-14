@@ -2213,7 +2213,7 @@ describe("multi-provider hardening", () => {
     vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
       const url = String(input);
       requestedUrls.push(url);
-      if (!url.endsWith("/messages")) throw new Error(`unexpected URL: ${url}`);
+      if (new URL(url).pathname !== "/v1/messages") throw new Error(`unexpected URL: ${url}`);
       return new Response(
         'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","content":[],"model":"claude-opus-4-6","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":0}}}\n\nevent: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\nevent: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}\n\nevent: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\nevent: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":1}}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n',
         { headers: { "content-type": "text/event-stream" } },
@@ -2254,6 +2254,6 @@ describe("multi-provider hardening", () => {
     const result = await models.complete(model, { messages: [] });
 
     expect(result.stopReason).toBe("stop");
-    expect(requestedUrls).toEqual(["https://credential.example.com/v1/messages"]);
+    expect(requestedUrls).toEqual(["https://credential.example.com/v1/messages?beta=true"]);
   });
 });

@@ -149,7 +149,7 @@ describe("dispatch routing through Pi's provider composer", () => {
     // The mock speaks Chat SSE; only the request destination and credentials matter here.
     await models.complete(entry, { messages: [] });
 
-    expect(wire.map((request) => request.url)).toEqual([`${CREDENTIAL_ROOT}/v1/messages`]);
+    expect(wire.map((request) => request.url)).toEqual([`${CREDENTIAL_ROOT}/v1/messages?beta=true`]);
     expect([CANARY_CREDENTIAL, `Bearer ${CANARY_CREDENTIAL}`]).toContain(wire[0]?.authorization);
     expect(wire[0]?.tenant).toBe("canary-tenant");
     assertNoForeignCredential(wire);

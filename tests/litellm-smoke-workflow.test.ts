@@ -186,7 +186,7 @@ describe("LiteLLM smoke workflow", () => {
     // extension's own path: it is pinned by a scoped grep plus an occurrence count.
     expect(workflow).toContain('messages_log_since="$(date -u +%Y-%m-%dT%H:%M:%SZ)"');
     expect(workflow).toContain('docker logs --since "$messages_log_since" litellm-smoke');
-    expect(workflow).toContain('POST /v1/messages HTTP/1.1" 200');
+    expect(workflow.split('POST /v1/messages(\\?beta=true)? HTTP/1.1" 200')).toHaveLength(3);
     expect(workflow).toContain(".tmp/litellm.log || true)");
     expect(workflow).toContain(`messages_requests="\${messages_requests:-0}"`);
     expect(workflow).toContain('test "$messages_requests" -ge 2');
