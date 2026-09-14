@@ -1054,7 +1054,47 @@ async function loginOAuth(interaction: AuthInteraction, definition: ProviderDefi
   };
 }
 
-async function refreshLiteLLM(credentials: OAuthCredentials, _signal?: AbortSignal): Promise<OAuthCredentials> {
+async function refreshLiteLLM(
+  credentials: OAuthCredentials,
+  definition: ProviderDefinition,
+  signal?: AbortSignal,
+): Promise<OAuthCredentials> {
+  signal?.throwIfAborted();
+  if (credentials.flow === PKCE_FLOW) {
+    if (
+      typeof credentials.baseUrl !== "string" ||
+      !isAuthToken(credentials.clientId) ||
+      !isAuthToken(credentials.access) ||
+      !isAuthToken(credentials.refresh) ||
+      !Number.isSafeInteger(credentials.expires)
+    ) {
+      throw new Error("Invalid LiteLLM PKCE credential; run /login litellm again");
+    }
+    const baseUrl = requireCredentialRoot(
+      normalizeBaseUrl(credentials.baseUrl, definition.allowInsecureHttp),
+      definition.name,
+    );
+    canonicalIssuer(baseUrl);
+    const issuer = new URL(baseUrl);
+    const tokenEndpoint = sameOriginUrl(credentials.tokenEndpoint, issuer, "token endpoint");
+    const resource = sameOriginUrl(credentials.resource, issuer, "resource");
+    const result = await requestPkceToken(
+      tokenEndpoint,
+      new URLSearchParams({
+        grant_type: "refresh_token",
+        refresh_token: credentials.refresh,
+        client_id: credentials.clientId,
+        resource,
+      }),
+      signal ?? AbortSignal.timeout(LOGIN_TIMEOUT_MS),
+      resolveHeaders(definition),
+    );
+    if (!result.ok) {
+      if (result.transient && Date.now() < credentials.expires) return credentials;
+      throw new Error(`${result.message}; run /login litellm again`);
+    }
+    return { ...credentials, ...result.token };
+  }
   if (!credentials.refresh.startsWith("!")) {
     if (credentials.expires < PERMANENT_TOKEN_EXPIRES_AT) {
       throw new Error("LiteLLM credential cannot be refreshed; run /login litellm again");
@@ -1191,7 +1231,7 @@ function createProviderAuth(definition: ProviderDefinition, clearOAuthRuntimeRoo
           loginLabel: "Sign in with LiteLLM SSO",
           login: (interaction) => loginOAuth(interaction, definition),
           refresh: async (credential, signal) => ({
-            ...(await refreshLiteLLM(credential, signal)),
+            ...(await refreshLiteLLM(credential, definition, signal)),
             type: "oauth" as const,
           }),
           toAuth: async (credential) => ({

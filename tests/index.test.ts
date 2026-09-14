@@ -1400,6 +1400,191 @@ describe("extension startup", () => {
     expect(await readHelperCount(agentDir)).toBe(1);
   });
 
+  describe("PKCE refresh", () => {
+    const pkceCredential = () => ({
+      type: "oauth" as const,
+      access: "access-old",
+      refresh: "refresh-old",
+      expires: Date.now() + 60_000,
+      flow: "litellm_cli_pkce",
+      baseUrl: "https://proxy.example.com",
+      clientId: "llm_dcrc_client",
+      tokenEndpoint: "https://proxy.example.com/token",
+      resource: "https://proxy.example.com",
+    });
+
+    it("rotates PKCE refresh credentials", async () => {
+      const now = 1_800_000_000_000;
+      process.env.LITELLM_DISCOVERY_TIMEOUT_MS = "0";
+      process.env.LITELLM_HEADERS = '{"x-tenant":"tenant-a"}';
+      const extension = await loadExtension(await makeAgentDir());
+      const pi = createPi();
+      await extension(pi);
+      vi.spyOn(Date, "now").mockReturnValue(now);
+      const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+        jsonResponse(200, {
+          access_token: "access-new",
+          refresh_token: "refresh-new",
+          token_type: "bearer",
+          expires_in: 3600,
+        }),
+      );
+      const credential = pkceCredential();
+
+      await expect(pi.providers[0]?.auth.oauth?.refresh(credential, TEST_SIGNAL)).resolves.toEqual({
+        ...credential,
+        access: "access-new",
+        refresh: "refresh-new",
+        expires: now + 3_600_000,
+      });
+      expect(fetchMock).toHaveBeenCalledOnce();
+      const [, init] = fetchMock.mock.calls[0]!;
+      expect(Object.fromEntries(new URLSearchParams(String(init?.body)))).toEqual({
+        grant_type: "refresh_token",
+        refresh_token: "refresh-old",
+        client_id: "llm_dcrc_client",
+        resource: "https://proxy.example.com",
+      });
+      expect(init?.redirect).toBe("manual");
+      expect(new Headers(init?.headers).get("x-tenant")).toBe("tenant-a");
+    });
+
+    it.each([429, 500, 503, "network", "body"])("keeps fresh PKCE credentials after %s", async (failure) => {
+      const now = 1_800_000_000_000;
+      process.env.LITELLM_DISCOVERY_TIMEOUT_MS = "0";
+      const extension = await loadExtension(await makeAgentDir());
+      const pi = createPi();
+      await extension(pi);
+      vi.spyOn(Date, "now").mockReturnValue(now);
+      vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+        if (failure === "network") throw new TypeError("network unavailable");
+        if (failure === "body") {
+          return new Response(
+            new ReadableStream({
+              start(controller) {
+                controller.error(new TypeError("connection closed"));
+              },
+            }),
+          );
+        }
+        return jsonResponse(failure as number, {});
+      });
+      const credential = pkceCredential();
+
+      await expect(pi.providers[0]?.auth.oauth?.refresh(credential, TEST_SIGNAL)).resolves.toEqual(credential);
+    });
+
+    it("rejects a transient PKCE refresh failure after expiry", async () => {
+      const now = 1_800_000_000_000;
+      process.env.LITELLM_DISCOVERY_TIMEOUT_MS = "0";
+      const extension = await loadExtension(await makeAgentDir());
+      const pi = createPi();
+      await extension(pi);
+      vi.spyOn(Date, "now").mockReturnValue(now);
+      vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse(503, {}));
+      const credential = { ...pkceCredential(), expires: now };
+
+      await expect(pi.providers[0]?.auth.oauth?.refresh(credential, TEST_SIGNAL)).rejects.toThrow(
+        "LiteLLM token exchange failed (HTTP 503); run /login litellm again",
+      );
+    });
+
+    it("sanitizes PKCE refresh OAuth errors", async () => {
+      process.env.LITELLM_DISCOVERY_TIMEOUT_MS = "0";
+      const extension = await loadExtension(await makeAgentDir());
+      const pi = createPi();
+      await extension(pi);
+      vi.spyOn(globalThis, "fetch").mockResolvedValue(
+        jsonResponse(400, {
+          error: "invalid_grant",
+          error_description: "refresh-old\naccess-old\u001b[31m",
+          token: "unrelated-secret",
+        }),
+      );
+
+      await expect(pi.providers[0]?.auth.oauth?.refresh(pkceCredential(), TEST_SIGNAL)).rejects.toThrow(
+        "LiteLLM token exchange rejected (invalid_grant); run /login litellm again",
+      );
+    });
+
+    it.each([
+      { tokenEndpoint: "https://attacker.example.com/token" },
+      { resource: "https://attacker.example.com" },
+      { tokenEndpoint: "https://secret@proxy.example.com/token" },
+      { tokenEndpoint: "https://proxy.example.com/token#fragment" },
+      { tokenEndpoint: "blob:https://proxy.example.com/token" },
+      { baseUrl: "https://secret@proxy.example.com" },
+      { baseUrl: "http://proxy.example.com" },
+      { clientId: "" },
+      { refresh: "" },
+    ])("rejects malformed PKCE refresh metadata before fetching: %j", async (override) => {
+      process.env.LITELLM_DISCOVERY_TIMEOUT_MS = "0";
+      const extension = await loadExtension(await makeAgentDir());
+      const pi = createPi();
+      await extension(pi);
+      const fetchMock = vi.spyOn(globalThis, "fetch");
+
+      await expect(
+        pi.providers[0]?.auth.oauth?.refresh({ ...pkceCredential(), ...override }, TEST_SIGNAL),
+      ).rejects.toThrow();
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it("preserves cancellation while reading the PKCE token response", async () => {
+      process.env.LITELLM_DISCOVERY_TIMEOUT_MS = "0";
+      const extension = await loadExtension(await makeAgentDir());
+      const pi = createPi();
+      await extension(pi);
+      const controller = new AbortController();
+      const reason = new Error("cancelled token body");
+      vi.spyOn(globalThis, "fetch").mockResolvedValue(
+        Object.assign(jsonResponse(200, {}), {
+          json: async () => {
+            controller.abort(reason);
+            throw reason;
+          },
+        }),
+      );
+      await expect(pi.providers[0]?.auth.oauth?.refresh(pkceCredential(), controller.signal)).rejects.toBe(reason);
+    });
+
+    it.each([false, true])("uses Pi's credential lock and persistence (transient: %s)", async (transient) => {
+      process.env.LITELLM_DISCOVERY_TIMEOUT_MS = "0";
+      const extension = await loadExtension(await makeAgentDir());
+      const pi = createPi();
+      await extension(pi);
+      const stored = pkceCredential();
+      const credentials = new InMemoryCredentialStore();
+      await credentials.modify("litellm", async () => stored);
+      const models = createModels({
+        credentials,
+        modelsStore: new InMemoryModelsStore(),
+        authContext: { env: async () => undefined, fileExists: async () => false },
+      });
+      models.setProvider(pi.providers[0]!);
+      const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async () =>
+        transient
+          ? jsonResponse(503, {})
+          : jsonResponse(200, {
+              access_token: "access-new",
+              refresh_token: "refresh-new",
+              token_type: "Bearer",
+              expires_in: 3600,
+            }),
+      );
+      const results = await Promise.all([models.getAuth("litellm"), models.getAuth("litellm")]);
+      expect(fetchMock).toHaveBeenCalledTimes(transient ? 2 : 1);
+      const access = transient ? "access-old" : "access-new";
+      expect(results.map((result) => result?.auth.apiKey)).toEqual([access, access]);
+      expect(await credentials.read("litellm")).toMatchObject({
+        ...stored,
+        access,
+        refresh: transient ? "refresh-old" : "refresh-new",
+        expires: expect.any(Number),
+      });
+    });
+  });
+
   it("uses the refreshed OAuth access token during discovery", async () => {
     const agentDir = await makeAgentDir();
     const helperPath = await writeHelper(agentDir, ["unexpected-helper-run"]);
@@ -1518,7 +1703,7 @@ describe("extension startup", () => {
         return jsonResponse(200, {
           contract_version: 1,
           issuer: "https://litellm.example.com",
-          authorization_endpoint: "https://litellm.example.com/authorize",
+          authorization_endpoint: "https://litellm.example.com/authorize?tenant=alpha&client_id=wrong",
           token_endpoint: "https://litellm.example.com/token",
           registration_endpoint: "https://litellm.example.com/register",
           resource: "https://litellm.example.com",
@@ -1704,7 +1889,7 @@ describe("extension startup", () => {
         return jsonResponse(200, {
           contract_version: 1,
           issuer: "https://litellm.example.com",
-          authorization_endpoint: "https://litellm.example.com/authorize?tenant=alpha&client_id=wrong",
+          authorization_endpoint: "https://litellm.example.com/authorize",
           token_endpoint: "https://litellm.example.com/token",
           registration_endpoint: "https://litellm.example.com/register",
           resource: "https://litellm.example.com",
