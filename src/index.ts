@@ -798,19 +798,18 @@ async function resolveApiKeyAuth(
   // routes an off-catalog model through a global API implementation that trusts model.baseUrl
   // verbatim, bypassing the provider's own host guard; Models.applyAuth overrides model.baseUrl
   // with auth.baseUrl on every path, so this keeps the credential from reaching a stale or
-  // attacker-supplied host. Leave it unset when no usable root resolves so the provider guard
-  // still rejects the request rather than pinning to a placeholder.
-  let pinnedRoot: string | undefined;
-  try {
-    pinnedRoot = requireCredentialRoot(resolveCredentialRoot(definition, credential, normalizedRoot), definition.name);
-  } catch {
-    pinnedRoot = undefined;
-  }
+  // attacker-supplied host. Fail auth resolution when no usable root resolves rather than
+  // returning a key with no pinned baseUrl, which would let the global fallback use a stale
+  // or foreign model.baseUrl instead.
+  const pinnedRoot = requireCredentialRoot(
+    resolveCredentialRoot(definition, credential, normalizedRoot),
+    definition.name,
+  );
   return {
     auth: {
       apiKey: creds.apiKey,
       headers: await resolveHeadersFromContext(definition, ctx.env),
-      ...(pinnedRoot ? { baseUrl: pinnedRoot } : {}),
+      baseUrl: pinnedRoot,
     },
     env: normalizedRoot ? { [ENV_BASE_URL]: normalizedRoot } : undefined,
     source: source ?? (creds.apiKeyFromGcloudAdc ? GCLOUD_ADC_SOURCE : undefined) ?? creds.apiKeyConfig ?? ENV_API_KEY,
@@ -1135,14 +1134,11 @@ export default async function (pi: ExtensionAPI): Promise<void> {
       credential,
       executeHelpers,
     );
-    if (!resolved?.auth.apiKey) {
+    if (!resolved?.auth.apiKey || !resolved.auth.baseUrl) {
       throw new Error(`no credentials for ${definition.name}. Run /login litellm or set env vars.`);
     }
     return {
-      baseUrl: requireCredentialRoot(
-        resolveCredentialRoot(definition, credential, resolved.env?.[ENV_BASE_URL]),
-        definition.name,
-      ),
+      baseUrl: resolved.auth.baseUrl,
       apiKey: resolved.auth.apiKey,
       headers: resolved.auth.headers,
       allowInsecureHttp: definition.allowInsecureHttp,
@@ -1373,9 +1369,15 @@ export default async function (pi: ExtensionAPI): Promise<void> {
           !discoveryDisabledReason() &&
           context.credential
         ) {
-          const auth = await authForCredential(definition, context.credential);
-          defaultRuntimeAuth = auth;
-          void registerMcpTools(auth, context.signal).catch(() => undefined);
+          // Best-effort: refreshing the cached default auth / MCP catalog must not let a bad or
+          // placeholder credential override refreshModels' own try/throw outcome via `finally`.
+          try {
+            const auth = await authForCredential(definition, context.credential);
+            defaultRuntimeAuth = auth;
+            void registerMcpTools(auth, context.signal).catch(() => undefined);
+          } catch {
+            // ignored — authForCredential already reported/will report this via the paths that use it directly.
+          }
         }
       }
     };
