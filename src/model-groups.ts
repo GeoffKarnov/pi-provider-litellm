@@ -752,7 +752,7 @@ export function reduceModelGroup(
   const messagesCompat = unanimous(catalogs.map((catalog) => stableJson(catalog?.messagesCompat)));
   const messagesEndpointAllowed = deployments.every((entry) => {
     const endpoints = entry.model_info?.supported_endpoints;
-    return !Array.isArray(endpoints) || endpoints.includes("/v1/messages");
+    return endpoints === undefined || (Array.isArray(endpoints) && endpoints.includes("/v1/messages"));
   });
   const api = candidateModes.every((mode) => mode === "responses")
     ? "openai-responses"

@@ -2287,6 +2287,17 @@ describe("native Messages route selection", () => {
     expect(partiallyMalformedOmittingMessages?.api).toBe("openai-completions");
   });
 
+  it.each([null, "/v1/chat/completions", "/v1/messages", 42, { endpoint: "/v1/messages" }])(
+    "withholds Messages for malformed endpoint metadata %j",
+    (endpoints) => {
+      const result = reduceModelGroup(
+        [{ model_name: "claude-route", model_info: { mode: "chat", supported_endpoints: endpoints as never } }],
+        () => claude({}),
+      );
+      expect(result?.api).toBe("openai-completions");
+    },
+  );
+
   it.each([
     ["mixed family", [claude({}), { provider: "openai", semanticFamily: "openai" as const }]],
     ["unknown sibling", [claude({}), undefined]],
