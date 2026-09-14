@@ -143,8 +143,9 @@ function supportsResponses(entry: ModelInfoEntry): boolean {
   if (!azureAdapter) return true;
 
   const version = entry.litellm_params?.api_version?.trim();
-  const date = version?.match(/^(\d{4}-\d{2}-\d{2})(?:-preview)?$/)?.[1];
-  return date === undefined || date >= "2025-03-01";
+  if (!version) return true;
+  const date = version.match(/^(\d{4}-\d{2}-\d{2})(?:-preview)?$/)?.[1];
+  return date !== undefined && date >= "2025-03-01";
 }
 
 export function modelProtocol(modelId: string, modeOrEntry?: string | null | ModelInfoEntry): ModelProtocol {
