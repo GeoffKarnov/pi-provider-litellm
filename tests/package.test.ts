@@ -277,16 +277,25 @@ describe("pi package compatibility", () => {
     const sourceDir = join(repoRoot, "src");
     const sourceFiles = (await readdir(sourceDir, { recursive: true })).filter((file) => file.endsWith(".ts"));
     const imports = await Promise.all(
-      sourceFiles.map(
-        async (file) => [file, importSpecifiers(await readFile(join(sourceDir, file), "utf8"), file)] as const,
-      ),
+      sourceFiles.map(async (file) => {
+        const source = await readFile(join(sourceDir, file), "utf8");
+        return [file, source, importSpecifiers(source, file)] as const;
+      }),
     );
 
-    // A scanner bug that returned nothing would make the allowlist vacuously true, so
-    // require the shipped source set to yield specifiers. Pure helper modules may have no
-    // imports. The oracle itself is pinned by tests/import-specifiers.test.ts.
+    // A scanner bug that returned nothing would make the allowlist vacuously true. Pure helper
+    // modules may genuinely have no imports (checked below file by file, not just in aggregate,
+    // so a scanner regression isolated to one file with real imports cannot hide behind another
+    // file's non-empty result). The oracle itself is pinned by tests/import-specifiers.test.ts.
     expect(sourceFiles.length).toBeGreaterThan(0);
-    expect(imports.flatMap(([, specifiers]) => specifiers).length).toBeGreaterThan(0);
+    for (const [file, source, specifiers] of imports) {
+      if (/\bimport\b/.test(source)) {
+        expect(
+          specifiers.length,
+          `${file}: source contains "import" but the scanner found no specifiers`,
+        ).toBeGreaterThan(0);
+      }
+    }
 
     const allowed = new Set([
       "@earendil-works/pi-ai",
@@ -294,7 +303,7 @@ describe("pi package compatibility", () => {
       "@earendil-works/pi-ai/providers/all",
       "@earendil-works/pi-coding-agent",
     ]);
-    for (const [file, specifiers] of imports) {
+    for (const [file, , specifiers] of imports) {
       for (const specifier of specifiers) {
         // UNVERIFIABLE_SPECIFIER and FORBIDDEN_RESOLVER land here too: a computed `import()`
         // cannot be shown to resolve to something the loader provides, and a CommonJS or
