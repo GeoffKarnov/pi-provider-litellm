@@ -443,7 +443,8 @@ function applyWildcardEvidence(
     .sort((left, right) => {
       const [leftLength, leftComplexity] = wildcardPatternSpecificity(left);
       const [rightLength, rightComplexity] = wildcardPatternSpecificity(right);
-      return rightLength - leftLength || rightComplexity - leftComplexity || left.localeCompare(right);
+      // Fewer wildcards (lower complexity) is more specific when escaped length ties.
+      return rightLength - leftLength || leftComplexity - rightComplexity || left.localeCompare(right);
     })[0];
   if (!selectedPattern || !publishedWildcardIds.has(selectedPattern)) return undefined;
   const parents = matchingRows
