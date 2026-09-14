@@ -264,6 +264,35 @@ describe("Kimi reasoning compatibility", () => {
 });
 
 describe("discoverModels via /model/info", () => {
+  it.each([
+    { mode: "chat", api: "openai-completions", params: { model: "chatgpt/gpt-5.6-sol" } },
+    {
+      mode: "responses",
+      api: "openai-responses",
+      params: { model: "gpt-5.6-sol", custom_llm_provider: "chatgpt" },
+    },
+  ])("enriches a ChatGPT subscription alias while retaining $mode routing", async ({ mode, api, params }) => {
+    const entry = { model_name: "high", litellm_params: params, model_info: { mode } };
+    // The synchronous fallback must work even when public-catalog loading exceeds its budget.
+    expect(resolveModelInfoCatalog(entry)).toMatchObject({
+      provider: "chatgpt",
+      catalogModelId: "gpt-5.6-sol",
+      contextWindow: 272_000,
+      maxTokens: 128_000,
+    });
+    mockEndpoints({ "/model/info": () => jsonResponse(200, { data: [entry] }) });
+
+    const result = await discoverModels("https://litellm.example.com", "sk-test", { modelsDev: false });
+
+    expect(result.models[0]).toMatchObject({
+      id: "high",
+      api,
+      contextWindow: 272_000,
+      maxTokens: 128_000,
+      reasoning: true,
+    });
+  });
+
   it("enriches the backend identity from models.dev before synchronous group reduction", async () => {
     const dir = await mkdtemp(join(tmpdir(), "litellm-model-info-catalog-"));
     const cachePath = join(dir, "models-dev.json");

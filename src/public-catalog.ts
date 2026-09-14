@@ -68,6 +68,7 @@ const PROVIDER_ALIASES: Readonly<Record<string, readonly string[]>> = {
 const PI_PROVIDER_ALIASES: Readonly<Record<string, readonly string[]>> = {
   "amazon-bedrock": ["amazon-bedrock"],
   azure: ["azure-openai-responses"],
+  chatgpt: ["openai-codex"],
   "fireworks-ai": ["fireworks"],
   openai: ["openai"],
 };

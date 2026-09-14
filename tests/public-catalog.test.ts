@@ -43,6 +43,22 @@ async function loadWithFreshCache() {
 afterEach(() => vi.restoreAllMocks());
 
 describe("loadPublicCatalog", () => {
+  it.each(["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"])(
+    "enriches the ChatGPT subscription model %s from Pi's Codex catalog",
+    async (modelId) => {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async () => response({})),
+      );
+      const catalog = await loadWithFreshCache();
+      expect(catalog.lookup("chatgpt", modelId)).toMatchObject({
+        provider: "openai-codex",
+        modelId,
+        limits: { context: 272_000, output: 128_000 },
+      });
+    },
+  );
+
   it("falls back from the Azure adapter to the OpenAI vendor catalog", async () => {
     vi.stubGlobal(
       "fetch",

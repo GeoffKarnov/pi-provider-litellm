@@ -271,6 +271,7 @@ const ADAPTER_CATALOG_PROVIDERS: Readonly<Record<string, BuiltinProvider>> = {
   azure_ai: "azure-openai-responses",
   bedrock: "amazon-bedrock",
   bedrock_converse: "amazon-bedrock",
+  chatgpt: "openai-codex",
   deepseek: "deepseek",
   "fireworks-ai": "fireworks",
   fireworks_ai: "fireworks",
