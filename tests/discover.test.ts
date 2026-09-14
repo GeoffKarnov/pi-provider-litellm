@@ -5938,6 +5938,37 @@ describe("native Messages discovery", () => {
     ]);
   });
 
+  it("rechecks Chat reasoning levels when health discovery downgrades Messages", async () => {
+    mockEndpoints({
+      "/model/info": () => jsonResponse(404, {}),
+      "/v1/models": () => jsonResponse(404, {}),
+      "/health": () => jsonResponse(200, { healthy_endpoints: [{ model: "claude-route", model_id: "claude-id" }] }),
+      "/model/info?litellm_model_id=claude-id": () =>
+        jsonResponse(200, {
+          data: [
+            {
+              model_name: "claude-route",
+              litellm_params: { model: "anthropic/claude-opus-5" },
+              model_info: {
+                mode: "chat",
+                litellm_provider: "anthropic",
+                supports_reasoning: true,
+                supports_low_reasoning_effort: true,
+                supported_openai_params: ["reasoning_effort"],
+              },
+            },
+          ],
+        }),
+    });
+    const result = await discoverModels("https://litellm.example.com", "sk-test", { modelsDev: false });
+    const model = { ...result.models[0]!, provider: "litellm", baseUrl: "https://proxy.example.com/v1" };
+    expect(model).toMatchObject({ api: "openai-completions", compat: { supportsReasoningEffort: true } });
+    const levels = getSupportedThinkingLevels(model);
+    expect(levels).toContain("low");
+    expect(levels).not.toContain("xhigh");
+    expect(levels).not.toContain("max");
+  });
+
   it("never selects native Messages from /health, even with complete matching detail", async () => {
     mockEndpoints({
       "/model/info?litellm_model_id=uuid-claude": () =>
@@ -5969,7 +6000,6 @@ describe("native Messages discovery", () => {
       api: "openai-completions",
       compat: {
         supportsStore: false,
-        supportsReasoningEffort: false,
         cacheControlFormat: "anthropic",
       },
       thinkingLevelMap: {

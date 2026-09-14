@@ -612,6 +612,7 @@ function mapFromModelInfoGroup(
     const model = new Set(generations).size === 1 && family !== "conflicting" ? generations[0] : undefined;
     return {
       ...catalog,
+      ...(options.allowMessages === false ? { messagesCompat: undefined } : {}),
       ...(family ? { semanticFamily: family } : {}),
       ...(model ? { semanticModel: model } : {}),
     };
@@ -621,7 +622,7 @@ function mapFromModelInfoGroup(
   if (reduced.deploymentFamilies.includes("conflicting")) options.conflictingFamilyRoutes?.push(reduced.id);
   const protocols = entries.map((entry) => modelProtocol(reduced.id, entry));
   const protocol = protocols.find((candidate) => candidate.api === "openai-completions") ?? protocols[0]!;
-  const api = reduced.api === "anthropic-messages" && options.allowMessages !== false ? reduced.api : protocol.api;
+  const api = reduced.api === "anthropic-messages" ? reduced.api : protocol.api;
   const families = new Set(entries.map((entry) => resolveBackendIdentity({ ...entry, model_name: undefined })?.family));
   const [family] = families;
   const hasBackendEvidence = entries.some(hasReadableBackendEvidence);
