@@ -42,6 +42,8 @@ export interface DiscoveryOptions {
   signal?: AbortSignal;
   headers?: Record<string, string>;
   allowInsecureHttp?: boolean;
+  modelsDev?: boolean;
+  modelsDevCachePath?: string;
 }
 
 export interface ModelInfoEntry {
@@ -52,6 +54,7 @@ export interface ModelInfoEntry {
     api_version?: string;
   };
   model_info?: {
+    id?: string;
     mode?: string | null;
     base_model?: string;
     litellm_provider?: string;

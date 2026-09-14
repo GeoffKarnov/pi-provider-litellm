@@ -3,13 +3,25 @@ import type { Api, Model } from "@earendil-works/pi-ai";
 import { getModels, getProviders } from "@earendil-works/pi-ai/compat";
 import type { BuiltinProvider } from "@earendil-works/pi-ai/providers/all";
 import { LITELLM_DISCOVERY_VERSION, resolveBackendIdentity } from "./backend-identity.js";
+import {
+  type CatalogResolution,
+  catalogResolution,
+  conservativeCostTiers,
+  DEFAULT_CONTEXT_WINDOW,
+  DEFAULT_MAX_TOKENS,
+  hasMixedIncompatibleDeploymentModes,
+  normalizedMode,
+  reduceModelGroup,
+  wireString,
+} from "./model-groups.js";
+import { loadPublicCatalog, type PublicCatalog, type PublicCatalogRecord } from "./public-catalog.js";
+import { intersectThinkingLevelMaps } from "./thinking-levels.js";
 import type {
   DiscoveredModel,
   DiscoveredModelFor,
   DiscoveryOptions,
   DiscoveryResult,
   HealthResponse,
-  LiteLLMApi,
   ModelInfoEntry,
   ModelInfoResponse,
   ModelProtocol,
@@ -18,10 +30,15 @@ import type {
 } from "./types.js";
 
 const DEFAULT_TIMEOUT_MS = 5000;
-const DEFAULT_CONTEXT_WINDOW = 128_000;
-const DEFAULT_MAX_TOKENS = 16_384;
+const PUBLIC_CATALOG_BUDGET_MS = 1000;
+const PUBLIC_CATALOG_PROVIDER_BY_FAMILY = {
+  claude: "anthropic",
+  deepseek: "deepseek",
+  gemini: "gemini",
+  kimi: "moonshot",
+  openai: "openai",
+} as const;
 const KNOWN_PROVIDER_SET = new Set<string>(getProviders());
-
 export function normalizeBaseUrl(input: string, allowInsecureHttp = false): string {
   const url = new URL(input);
   const hostname = url.hostname.toLowerCase();
@@ -31,16 +48,6 @@ export function normalizeBaseUrl(input: string, allowInsecureHttp = false): stri
     throw new Error("LiteLLM base URL must use HTTPS except for loopback hosts");
   }
   return input.replace(/\/+$/, "").replace(/\/v1\/?$/i, "");
-}
-
-const RESPONSES_MODE_PATTERN = /^responses?$/i;
-
-function isResponsesMode(mode: string | null | undefined): boolean {
-  return mode != null && RESPONSES_MODE_PATTERN.test(mode);
-}
-
-function isChatStyleMode(mode: string | null | undefined): boolean {
-  return mode == null || mode === "chat" || isResponsesMode(mode);
 }
 
 // Matches both the conventional `anthropic/...` prefix and aliases that
@@ -69,17 +76,17 @@ const MOONSHOT_ROUTE_PROVIDERS = new Set(["moonshot", "moonshotai"]);
 function isMoonshotRoute(entry: ModelInfoEntry): boolean {
   const params = entry.litellm_params;
   if (!params) return false;
-  const model = params.model?.trim();
+  const model = wireString(params.model)?.trim();
   if (!model) return false;
   const providers = [
-    params.custom_llm_provider?.trim(),
+    wireString(params.custom_llm_provider)?.trim(),
     model.includes("/") ? model.split("/", 1)[0] : undefined,
   ].filter((provider): provider is string => Boolean(provider));
   return providers.length > 0 && providers.every((provider) => MOONSHOT_ROUTE_PROVIDERS.has(provider.toLowerCase()));
 }
 
-function shouldSuppressReasoningContent(modelId: string, entry: ModelInfoEntry): boolean {
-  const routeModelId = entry.litellm_params?.model;
+function shouldSuppressRouteReasoningContent(modelId: string, entry: ModelInfoEntry): boolean {
+  const routeModelId = wireString(entry.litellm_params?.model);
   return (
     isMoonshotRoute(entry) &&
     !FORCED_THINKING_MODEL_PATTERN.test(modelId) &&
@@ -96,8 +103,12 @@ function aggregateSuppressionEvidence(evidence: Iterable<boolean>): boolean {
   return hasEvidence;
 }
 
-export function emitsThinkTags(modelId: string): boolean {
+function shouldSuppressReasoningContent(modelId: string): boolean {
   return isMoonshotModel(modelId) && !FORCED_THINKING_MODEL_PATTERN.test(modelId);
+}
+
+export function emitsThinkTags(modelId: string): boolean {
+  return shouldSuppressReasoningContent(modelId);
 }
 
 export function responsesCompat(modelId: string): DiscoveredModelFor<"openai-responses">["compat"] {
@@ -125,13 +136,13 @@ export function completionsCompat(modelId: string): DiscoveredModelFor<"openai-c
 function supportsResponses(entry: ModelInfoEntry): boolean {
   const endpoints = entry.model_info?.supported_endpoints;
   if (Array.isArray(endpoints)) return endpoints.some((endpoint) => endpoint === "/v1/responses");
-  if (isResponsesMode(entry.model_info?.mode)) return true;
+  if (normalizedMode(entry.model_info?.mode) === "responses") return true;
 
   const identity = resolveBackendIdentity(entry);
   if (identity?.family !== "openai") return false;
-  const adapter = entry.litellm_params?.custom_llm_provider?.trim().toLowerCase();
-  const configuredModel = entry.litellm_params?.model?.trim().toLowerCase();
-  const reportedProvider = entry.model_info?.litellm_provider?.trim().toLowerCase();
+  const adapter = wireString(entry.litellm_params?.custom_llm_provider)?.trim().toLowerCase();
+  const configuredModel = wireString(entry.litellm_params?.model)?.trim().toLowerCase();
+  const reportedProvider = wireString(entry.model_info?.litellm_provider)?.trim().toLowerCase();
   const azureAdapter =
     adapter === "azure" ||
     adapter === "azure_ai" ||
@@ -142,21 +153,18 @@ function supportsResponses(entry: ModelInfoEntry): boolean {
   // (litellm/responses/main.py, _bridges_to_chat_completions), so generic adapters remain eligible for Responses.
   if (!azureAdapter) return true;
 
-  const version = entry.litellm_params?.api_version?.trim();
+  const apiVersion = entry.litellm_params?.api_version;
+  if (apiVersion != null && typeof apiVersion !== "string") return false;
+  const version = apiVersion?.trim();
   if (!version) return true;
   const date = version.match(/^(\d{4}-\d{2}-\d{2})(?:-preview)?$/)?.[1];
   return date !== undefined && date >= "2025-03-01";
 }
 
-function forceCompletions(model: DiscoveredModel, modelId: string): void {
-  model.api = "openai-completions";
-  model.compat = completionsCompat(modelId);
-}
-
 export function modelProtocol(modelId: string, modeOrEntry?: string | null | ModelInfoEntry): ModelProtocol {
   const selectedEntry =
     typeof modeOrEntry === "object" && modeOrEntry !== null
-      ? modeOrEntry
+      ? { ...modeOrEntry, model_name: undefined }
       : { model_name: modelId, model_info: { mode: modeOrEntry } };
   return supportsResponses(selectedEntry)
     ? { api: "openai-responses", compat: responsesCompat(modelId) }
@@ -169,32 +177,41 @@ export function buildCompat(modelId: string): DiscoveredModelFor<"openai-complet
 
 function toKnownProvider(provider: string | undefined): BuiltinProvider | undefined {
   if (!provider) return undefined;
-  const normalized = provider.toLowerCase();
+  const normalized = provider.trim().toLowerCase();
   return KNOWN_PROVIDER_SET.has(normalized) ? (normalized as BuiltinProvider) : undefined;
 }
 
-function findCatalogModel(id: string, ownedBy?: string): Model<Api> | undefined {
-  const prefixProvider = toKnownProvider(id.split("/")[0]);
+// Anthropic recognition is derived from the single `catalogLookupIds` rule so a
+// second alias pattern cannot drift away from it. Every Anthropic catalog id and
+// every alias that maps onto one is canonicalized to a `claude-` lookup id,
+// including single-number names and dated snapshots.
+function catalogProviderCandidates(lookupIds: readonly string[], id: string, ownedBy?: string): BuiltinProvider[] {
+  const candidates = [toKnownProvider(ownedBy), toKnownProvider(id.split("/")[0])];
+  if (lookupIds.some((lookupId) => lookupId.startsWith("claude-"))) candidates.push("anthropic");
+  return [...new Set(candidates.filter((provider): provider is BuiltinProvider => provider !== undefined))];
+}
+
+function resolveCatalogModel(
+  id: string,
+  ownedBy?: string,
+): { provider: BuiltinProvider; model: Model<Api> } | undefined {
   const lookupIds = catalogLookupIds(id);
-  const candidates = [toKnownProvider(ownedBy), prefixProvider, lookupIds.length > 1 ? "anthropic" : undefined].filter(
-    (provider): provider is BuiltinProvider => provider !== undefined,
-  );
-
-  for (const provider of candidates) {
-    const match = findCatalogModelInProvider(provider, lookupIds);
-    if (match) return match;
+  for (const provider of catalogProviderCandidates(lookupIds, id, ownedBy)) {
+    const model = findCatalogModelInProvider(provider, lookupIds);
+    if (model) return { provider, model };
   }
-
-  for (const provider of getProviders()) {
-    const match = findCatalogModelInProvider(provider, lookupIds);
-    if (match) return match;
-  }
-
   return undefined;
 }
 
+function findCatalogModel(id: string, ownedBy?: string): Model<Api> | undefined {
+  return resolveCatalogModel(id, ownedBy)?.model;
+}
+
 export function enrichCachedModel(model: Model<Api>): Model<Api> {
-  // Legacy cache lacks field provenance, so enrich only the exact evidence-free default shape.
+  // This sentinel is emitted only by the evidence-free `/v1/models` fallback, so
+  // re-deriving catalog metadata from the model id here cannot re-authorize a
+  // reduced `/model/info` group whose catalog authority was withheld. Reduced
+  // groups carry the distinct ` (incomplete metadata)` marker instead.
   if (
     !model.name.endsWith(" (no metadata)") ||
     model.reasoning ||
@@ -215,7 +232,6 @@ export function enrichCachedModel(model: Model<Api>): Model<Api> {
   if (!catalogModel) return model;
   return {
     ...model,
-    ...catalogProtocol(model.id, catalogModel),
     name: catalogModel.name,
     reasoning: catalogModel.reasoning,
     thinkingLevelMap: catalogModel.thinkingLevelMap,
@@ -223,6 +239,7 @@ export function enrichCachedModel(model: Model<Api>): Model<Api> {
     cost: catalogModel.cost,
     contextWindow: catalogModel.contextWindow,
     maxTokens: catalogModel.maxTokens,
+    ...catalogProtocol(model.id, catalogModel),
   };
 }
 
@@ -249,23 +266,157 @@ function findCatalogModelInProvider(provider: BuiltinProvider, lookupIds: string
   return undefined;
 }
 
-function mapModelInfoCost(
-  info: NonNullable<ModelInfoEntry["model_info"]>,
-  fallback?: DiscoveredModel["cost"],
-): NonNullable<DiscoveredModel["cost"]> {
+const ADAPTER_CATALOG_PROVIDERS: Readonly<Record<string, BuiltinProvider>> = {
+  anthropic: "anthropic",
+  claude: "anthropic",
+  azure: "azure-openai-responses",
+  azure_ai: "azure-openai-responses",
+  bedrock: "amazon-bedrock",
+  bedrock_converse: "amazon-bedrock",
+  chatgpt: "openai-codex",
+  deepseek: "deepseek",
+  "fireworks-ai": "fireworks",
+  fireworks_ai: "fireworks",
+  gemini: "google",
+  kimi: "moonshotai",
+  moonshot: "moonshotai",
+  nvidia_nim: "nvidia",
+  openai: "openai",
+  together_ai: "together",
+  vertex_ai: "google-vertex",
+};
+
+function adapterCatalogProvider(adapter: unknown): BuiltinProvider | undefined {
+  const normalized = wireString(adapter)?.trim().toLowerCase();
+  return normalized ? (ADAPTER_CATALOG_PROVIDERS[normalized] ?? toKnownProvider(normalized)) : undefined;
+}
+
+function adaptPublicCatalogRecord(
+  provider: string,
+  catalogModelId: string,
+  record: PublicCatalogRecord | undefined,
+): CatalogResolution {
+  const piProvider = adapterCatalogProvider(record?.provider ?? provider);
+  const resolved = piProvider
+    ? (resolveCatalogModel(record?.modelId ?? catalogModelId, piProvider) ??
+      resolveCatalogModel(catalogModelId, piProvider))
+    : undefined;
+  const piCatalog = resolved ? catalogResolution(resolved.provider, resolved.model) : undefined;
+  const piCost = piCatalog?.cost;
   return {
-    input: info.input_cost_per_token !== undefined ? info.input_cost_per_token * 1_000_000 : (fallback?.input ?? 0),
-    output: info.output_cost_per_token !== undefined ? info.output_cost_per_token * 1_000_000 : (fallback?.output ?? 0),
-    cacheRead:
-      info.cache_read_input_token_cost !== undefined
-        ? info.cache_read_input_token_cost * 1_000_000
-        : (fallback?.cacheRead ?? 0),
-    cacheWrite:
-      info.cache_creation_input_token_cost !== undefined
-        ? info.cache_creation_input_token_cost * 1_000_000
-        : (fallback?.cacheWrite ?? 0),
-    ...(fallback?.tiers ? { tiers: fallback.tiers } : {}),
+    provider,
+    // A models.dev hit names the model canonically even when Pi's catalog does not know it yet,
+    // so two spellings of one backend model reduce to one identity instead of a conflict.
+    catalogModelId: resolved?.model.id ?? record?.modelId ?? catalogModelId,
+    ...(piCatalog?.reasoning !== undefined ? { reasoning: piCatalog.reasoning } : {}),
+    ...(piCatalog?.thinkingLevelMap ? { thinkingLevelMap: piCatalog.thinkingLevelMap } : {}),
+    ...(record?.modalities
+      ? { vision: record.modalities.includes("image") }
+      : piCatalog?.vision !== undefined
+        ? { vision: piCatalog.vision }
+        : {}),
+    ...(record?.limits?.context !== undefined
+      ? { contextWindow: record.limits.context }
+      : piCatalog?.contextWindow !== undefined
+        ? { contextWindow: piCatalog.contextWindow }
+        : {}),
+    ...(record?.limits?.output !== undefined
+      ? { maxTokens: record.limits.output }
+      : piCatalog?.maxTokens !== undefined
+        ? { maxTokens: piCatalog.maxTokens }
+        : {}),
+    ...(record?.cost || piCost
+      ? {
+          cost: {
+            ...((record?.cost?.input ?? piCost?.input) !== undefined
+              ? { input: record?.cost?.input ?? piCost?.input }
+              : {}),
+            ...((record?.cost?.output ?? piCost?.output) !== undefined
+              ? { output: record?.cost?.output ?? piCost?.output }
+              : {}),
+            ...((record?.cost?.cacheRead ?? piCost?.cacheRead) !== undefined
+              ? { cacheRead: record?.cost?.cacheRead ?? piCost?.cacheRead }
+              : {}),
+            ...((record?.cost?.cacheWrite ?? piCost?.cacheWrite) !== undefined
+              ? { cacheWrite: record?.cost?.cacheWrite ?? piCost?.cacheWrite }
+              : {}),
+            ...(piCost?.tiers ? { tiers: piCost.tiers } : {}),
+          },
+        }
+      : {}),
   };
+}
+
+export function resolveModelInfoCatalog(
+  entry: ModelInfoEntry,
+  publicCatalog?: PublicCatalog,
+): CatalogResolution | undefined {
+  const hasBackendIdentity = Boolean(
+    wireString(entry.model_info?.base_model)?.trim() || wireString(entry.litellm_params?.model)?.trim(),
+  );
+  if (!hasBackendIdentity) return undefined;
+  const identity = resolveBackendIdentity(entry);
+  if (!identity) return undefined;
+  if (identity.provider) {
+    const record = publicCatalog?.lookup(identity.provider, identity.modelId);
+    return adaptPublicCatalogRecord(identity.provider, identity.qualifiedId, record);
+  }
+  if (!identity.family) return undefined;
+
+  const publicProvider = PUBLIC_CATALOG_PROVIDER_BY_FAMILY[identity.family];
+  const record = publicCatalog?.lookup(publicProvider, identity.modelId);
+  return adaptPublicCatalogRecord(publicProvider, identity.qualifiedId, record);
+}
+
+function awaitWithSignal<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(signal.reason);
+  return new Promise<T>((resolve, reject) => {
+    const cleanup = () => signal.removeEventListener("abort", onAbort);
+    const onAbort = () => {
+      cleanup();
+      reject(signal.reason);
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => {
+        cleanup();
+        resolve(value);
+      },
+      (error) => {
+        cleanup();
+        reject(error);
+      },
+    );
+  });
+}
+
+async function awaitEnrichmentWithinBudget<T>(
+  promise: Promise<T>,
+  signal: AbortSignal | undefined,
+  timeoutMs: number,
+): Promise<T | undefined> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const budget = new Promise<undefined>((resolve) => {
+    timeout = setTimeout(() => resolve(undefined), timeoutMs);
+  });
+  try {
+    return await Promise.race([signal ? awaitWithSignal(promise, signal) : promise, budget]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+}
+
+function loadDiscoveryPublicCatalog(options: DiscoveryOptions): Promise<PublicCatalog | undefined> {
+  const publicCatalogPromise = loadPublicCatalog({
+    cachePath: options.modelsDevCachePath,
+    offline: options.modelsDev === false ? true : undefined,
+    timeoutMs: DEFAULT_TIMEOUT_MS,
+  });
+  return awaitEnrichmentWithinBudget(
+    publicCatalogPromise,
+    options.signal,
+    Math.min(options.timeoutMs ?? DEFAULT_TIMEOUT_MS, PUBLIC_CATALOG_BUDGET_MS),
+  );
 }
 
 async function fetchJson<T>(
@@ -285,62 +436,87 @@ async function fetchJson<T>(
   return { ok: true, data };
 }
 
-function mapReasoningEfforts(
-  info: NonNullable<ModelInfoEntry["model_info"]>,
-): NonNullable<DiscoveredModel["thinkingLevelMap"]> | undefined {
-  const flags = [
-    ["off", "none", info.supports_none_reasoning_effort],
-    ["minimal", "minimal", info.supports_minimal_reasoning_effort],
-    ["low", "low", info.supports_low_reasoning_effort],
-    ["medium", "medium", info.supports_medium_reasoning_effort],
-    ["high", "high", info.supports_high_reasoning_effort],
-    ["xhigh", "xhigh", info.supports_xhigh_reasoning_effort],
-    ["max", "max", info.supports_max_reasoning_effort],
-  ] as const;
-  const map = Object.fromEntries(
-    flags
-      .filter(([, , supported]) => supported !== undefined)
-      .map(([level, value, supported]) => [level, supported ? value : null]),
-  ) as NonNullable<DiscoveredModel["thinkingLevelMap"]>;
-  return Object.keys(map).length > 0 ? map : undefined;
+const DIAGNOSTIC_ROUTE_SAMPLE = 3;
+
+function reportBoundedRoutes(
+  reported: Set<string>,
+  routes: readonly string[],
+  describe: (count: number) => string,
+): void {
+  const unreported = [...new Set(routes)].filter((route) => !reported.has(route));
+  if (unreported.length === 0) return;
+  for (const route of unreported) reported.add(route);
+  const hidden = unreported.length - DIAGNOSTIC_ROUTE_SAMPLE;
+  const sample = unreported.slice(0, DIAGNOSTIC_ROUTE_SAMPLE).join(", ");
+  process.stderr.write(`${describe(unreported.length)}: ${sample}${hidden > 0 ? ` (+${hidden} more)` : ""}\n`);
 }
 
-function mapFromModelInfo(
-  entry: ModelInfoEntry,
-  suppressReasoningContent = shouldSuppressReasoningContent(entry.model_name ?? "", entry),
+// Reported routes, so a persistent misconfiguration is announced once rather than on
+// every background refresh and every `/model` open. Keyed by route rather than a
+// single flag so a newly ambiguous route is still reported. Mirrors the once-per-
+// process diagnostic set in src/index.ts.
+const reportedAmbiguousRoutes = new Set<string>();
+
+// Withholding catalog authority can be invisible in the model name when the router
+// supplies complete prices; limits and other catalog-derived metadata may still use
+// conservative defaults. Report that degradation regardless of
+// LITELLM_VERBOSE_DISCOVERY, carrying only a count and bounded public route ids.
+function reportAmbiguousCatalogAuthority(routes: readonly string[]): void {
+  reportBoundedRoutes(
+    reportedAmbiguousRoutes,
+    routes,
+    (count) =>
+      `LiteLLM discovery: ${count} route group(s) have missing or conflicting deployment provider evidence; ` +
+      "catalog limits, pricing, and reasoning metadata are withheld",
+  );
+}
+
+const reportedIncompatibleModeRoutes = new Set<string>();
+
+function reportIncompatibleDeploymentModes(routes: readonly string[]): void {
+  reportBoundedRoutes(
+    reportedIncompatibleModeRoutes,
+    routes,
+    (count) =>
+      `LiteLLM discovery: ${count} route group(s) mix chat-style and explicitly incompatible deployment modes; ` +
+      "the routes are withheld because not every deployment can accept chat requests",
+  );
+}
+
+function mapFromModelInfoGroup(
+  entries: readonly ModelInfoEntry[],
+  publicCatalog?: PublicCatalog,
+  ambiguousRoutes?: string[],
 ): DiscoveredModel | undefined {
-  const id = entry.model_name;
-  if (!id) return undefined;
-  const info = entry.model_info ?? {};
-  if (!isChatStyleMode(info.mode)) return undefined;
-  const catalogModel = findCatalogModel(id);
-  const backendFamily = resolveBackendIdentity(entry)?.family;
-  const reasoningEffortMap = mapReasoningEfforts(info);
-  const thinkingLevelMap =
-    catalogModel?.thinkingLevelMap || reasoningEffortMap
-      ? { ...catalogModel?.thinkingLevelMap, ...reasoningEffortMap }
-      : undefined;
+  const reduced = reduceModelGroup(entries, (entry) => resolveModelInfoCatalog(entry, publicCatalog));
+  if (!reduced) return undefined;
+  if (reduced.catalogAuthorityAmbiguous) ambiguousRoutes?.push(reduced.id);
+  const protocols = entries.map((entry) => modelProtocol(reduced.id, entry));
+  const protocol = protocols.find((candidate) => candidate.api === "openai-completions") ?? protocols[0]!;
+  const families = new Set(entries.map((entry) => resolveBackendIdentity({ ...entry, model_name: undefined })?.family));
+  const [family] = families;
+  // A surviving group contains only chat-style rows, because the reducer withholds
+  // every group containing an explicitly incompatible deployment mode.
+  const suppressReasoningContent = aggregateSuppressionEvidence(
+    entries.map((entry) => shouldSuppressRouteReasoningContent(reduced.id, entry)),
+  );
   return {
-    id,
-    name: id,
-    reasoning: info.supports_reasoning ?? false,
-    ...(thinkingLevelMap ? { thinkingLevelMap } : {}),
-    input: info.supports_vision ? ["text", "image"] : ["text"],
-    cost: mapModelInfoCost(info, catalogModel?.cost),
-    contextWindow: info.max_input_tokens ?? DEFAULT_CONTEXT_WINDOW,
-    maxTokens: info.max_output_tokens ?? DEFAULT_MAX_TOKENS,
-    ...modelProtocol(id, entry),
-    ...(backendFamily ? { litellmBackendFamily: backendFamily } : {}),
+    id: reduced.id,
+    // Reduced groups never borrow the ` (no metadata)` sentinel, which authorizes
+    // catalog re-derivation from the model id during offline cache reads. Complete
+    // router pricing does not make catalog-derived capabilities and limits authoritative.
+    name: reduced.hasCompleteMetadata ? reduced.id : `${reduced.id} (incomplete metadata)`,
+    reasoning: reduced.reasoning,
+    ...(reduced.thinkingLevelMap ? { thinkingLevelMap: reduced.thinkingLevelMap } : {}),
+    input: reduced.vision ? ["text", "image"] : ["text"],
+    cost: reduced.cost,
+    contextWindow: reduced.contextWindow,
+    maxTokens: reduced.maxTokens,
+    ...protocol,
+    ...(families.size === 1 && family ? { litellmBackendFamily: family } : {}),
     litellmDiscoveryVersion: LITELLM_DISCOVERY_VERSION,
     ...(suppressReasoningContent ? { suppressReasoningContent: true } : {}),
   };
-}
-
-function mapFromHealthModelInfo(entry: ModelInfoEntry, fallbackId: string | undefined): DiscoveredModel | undefined {
-  if (entry.model_name || !fallbackId) return mapFromModelInfo(entry);
-  const model = mapFromModelInfo({ ...entry, model_name: fallbackId });
-  if (model) delete model.thinkingLevelMap;
-  return model;
 }
 
 // An evidence-free fallback entry has no deployment or adapter evidence. Its route name
@@ -352,28 +528,21 @@ function catalogProtocol(modelId: string, catalogModel: Model<Api> | undefined):
     : { api: "openai-completions", compat: completionsCompat(modelId) };
 }
 
-function mapFromHealthEndpoint(entry: { model?: string }): DiscoveredModel | undefined {
-  const id = entry.model;
-  if (!id) return undefined;
-  const catalogModel = findCatalogModel(id);
+function syntheticHealthRow(route: string): ModelInfoEntry {
+  const catalogModel = findCatalogModel(route);
   return {
-    id,
-    name: catalogModel?.name ?? id,
-    reasoning: catalogModel?.reasoning ?? false,
-    thinkingLevelMap: catalogModel?.thinkingLevelMap,
-    input: catalogModel?.input ?? ["text"],
-    cost: catalogModel?.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    contextWindow: catalogModel?.contextWindow ?? DEFAULT_CONTEXT_WINDOW,
-    maxTokens: catalogModel?.maxTokens ?? DEFAULT_MAX_TOKENS,
-    ...catalogProtocol(id, catalogModel),
-    litellmDiscoveryVersion: LITELLM_DISCOVERY_VERSION,
+    model_name: route,
+    // When mixed with deployment details, a bare endpoint contributes only its
+    // catalog-supplied transport and cannot grant catalog metadata to the group.
+    model_info: { mode: catalogModel?.api === "openai-responses" ? "responses" : "chat" },
   };
 }
 
 function mapFromModelsList(entry: ModelsListEntry): DiscoveredModel | undefined {
-  const id = entry.id;
+  const id = wireString(entry.id);
   if (!id) return undefined;
-  const catalogModel = findCatalogModel(id, entry.owned_by);
+  const ownedBy = wireString(entry.owned_by);
+  const catalogModel = findCatalogModel(id, ownedBy);
   return {
     id,
     name: catalogModel?.name ?? `${id} (no metadata)`,
@@ -386,6 +555,95 @@ function mapFromModelsList(entry: ModelsListEntry): DiscoveredModel | undefined 
     ...catalogProtocol(id, catalogModel),
     litellmDiscoveryVersion: LITELLM_DISCOVERY_VERSION,
   };
+}
+
+async function discoverFromHealth(
+  base: string,
+  apiKey: string,
+  options: DiscoveryOptions & { onProgress?: (message: string) => void; silent?: boolean },
+): Promise<DiscoveredModel[]> {
+  const progress = options.silent ? undefined : options.onProgress;
+  progress?.("Querying /health endpoint...");
+  const healthResult = await fetchJson<HealthResponse>(`${base}/health`, apiKey, options);
+  if (!healthResult.ok) return [];
+  const endpoints = (healthResult.data.healthy_endpoints ?? []).filter((entry) => entry.model || entry.model_id);
+  progress?.(`Discovered ${endpoints.length} model endpoints, fetching details...`);
+  let completed = 0;
+  const denyThinkingLevels = new Set<ModelInfoEntry>();
+  const syntheticRows = new Set<ModelInfoEntry>();
+  const rows = await Promise.all(
+    endpoints.map(async (endpoint) => {
+      const healthRoute = wireString(endpoint.model);
+      let entry: ModelInfoEntry | undefined;
+      if (endpoint.model_id) {
+        const infoResult = await fetchJson<ModelInfoResponse>(
+          `${base}/model/info?litellm_model_id=${encodeURIComponent(endpoint.model_id)}`,
+          apiKey,
+          options,
+        );
+        const detail = infoResult.ok ? infoResult.data.data?.[0] : undefined;
+        if (detail) {
+          if (wireString(detail.model_name)) {
+            entry = detail;
+          } else if (healthRoute) {
+            entry = { ...detail, model_name: healthRoute };
+            denyThinkingLevels.add(entry);
+          }
+        }
+      }
+      if (!entry && healthRoute) {
+        entry = syntheticHealthRow(healthRoute);
+        syntheticRows.add(entry);
+      }
+      completed++;
+      if (completed % 10 === 0 || completed === endpoints.length) {
+        progress?.(`Fetched ${completed}/${endpoints.length} models...`);
+      }
+      return entry;
+    }),
+  );
+  const groups = new Map<string, ModelInfoEntry[]>();
+  for (const entry of rows) {
+    const route = wireString(entry?.model_name);
+    if (!entry || !route) continue;
+    const group = groups.get(route) ?? [];
+    group.push(entry);
+    groups.set(route, group);
+  }
+  const publicCatalog = rows.some((entry) => entry && !syntheticRows.has(entry))
+    ? await loadDiscoveryPublicCatalog(options)
+    : undefined;
+  const incompatibleModeRoutes: string[] = [];
+  const models = [...groups.entries()]
+    .map(([route, group]) => {
+      if (hasMixedIncompatibleDeploymentModes(group)) incompatibleModeRoutes.push(route);
+      const model = group.every((entry) => syntheticRows.has(entry))
+        ? mapFromModelsList({ id: route })
+        : mapFromModelInfoGroup(group, publicCatalog);
+      if (model && group.some((entry) => denyThinkingLevels.has(entry))) delete model.thinkingLevelMap;
+      return model;
+    })
+    .filter((model): model is DiscoveredModel => model !== undefined);
+  reportIncompatibleDeploymentModes(incompatibleModeRoutes);
+  return models;
+}
+
+function deduplicateModels(models: DiscoveredModel[]): DiscoveredModel[] {
+  const entries = new Map<string, { model: DiscoveredModel; suppressions: boolean[] }>();
+  for (const model of models) {
+    const existing = entries.get(model.id);
+    if (existing) {
+      existing.suppressions.push(model.suppressReasoningContent === true);
+    } else {
+      entries.set(model.id, { model, suppressions: [model.suppressReasoningContent === true] });
+    }
+  }
+  return [...entries.values()].map(({ model, suppressions }) => {
+    const deduplicated = { ...model };
+    if (aggregateSuppressionEvidence(suppressions)) deduplicated.suppressReasoningContent = true;
+    else delete deduplicated.suppressReasoningContent;
+    return deduplicated;
+  });
 }
 
 export function wildcardMatches(route: string, modelId: string): boolean {
@@ -405,8 +663,8 @@ export function wildcardMatches(route: string, modelId: string): boolean {
 // the deployment's own `model` (`azure/*` + `azure/gpt-5.5` → `azure/gpt-5.5`), so the row a
 // child actually runs on names that concrete backend model.
 function resolveWildcardRow(row: ModelInfoEntry, modelId: string): ModelInfoEntry {
-  const route = row.model_name ?? "";
-  const backend = row.litellm_params?.model;
+  const route = wireString(row.model_name) ?? "";
+  const backend = wireString(row.litellm_params?.model);
   if (!route.includes("*") || !backend?.includes("*")) return { ...row, model_name: modelId };
   // Capture each `*` segment of the route against modelId, then substitute those captures
   // positionally into the backend's own wildcards, so a route with 2+ stars (e.g. "team/*-*")
@@ -457,7 +715,7 @@ function applyWildcardEvidence(
     .map((row) => resolveWildcardRow(row, model.id));
   const protocols = parents.map((row) => modelProtocol(model.id, row));
   const protocol = protocols.find((candidate) => candidate.api === "openai-completions") ?? protocols[0];
-  const families = new Set(parents.map((row) => resolveBackendIdentity(row)?.family));
+  const families = new Set(parents.map((row) => resolveBackendIdentity({ ...row, model_name: undefined })?.family));
   const [family] = families;
   const { litellmBackendFamily: _ignored, ...rest } = model;
   return {
@@ -467,78 +725,50 @@ function applyWildcardEvidence(
   };
 }
 
-async function discoverFromHealth(
-  base: string,
-  apiKey: string,
-  options: DiscoveryOptions & { onProgress?: (message: string) => void; silent?: boolean },
-): Promise<DiscoveredModel[]> {
-  const progress = options.silent ? undefined : options.onProgress;
-  progress?.("Querying /health endpoint...");
-  const healthResult = await fetchJson<HealthResponse>(`${base}/health`, apiKey, options);
-  if (!healthResult.ok) return [];
-  const endpoints = (healthResult.data.healthy_endpoints ?? []).filter((entry) => entry.model || entry.model_id);
-  progress?.(`Discovered ${endpoints.length} model endpoints, fetching details...`);
-  let completed = 0;
-  const models = await Promise.all(
-    endpoints.map(async (endpoint) => {
-      let model = mapFromHealthEndpoint(endpoint);
-      if (endpoint.model_id) {
-        const infoResult = await fetchJson<ModelInfoResponse>(
-          `${base}/model/info?litellm_model_id=${encodeURIComponent(endpoint.model_id)}`,
-          apiKey,
-          options,
-        );
-        const entry = infoResult.ok ? infoResult.data.data?.[0] : undefined;
-        if (entry) model = mapFromHealthModelInfo(entry, endpoint.model);
-      }
-      completed++;
-      if (completed % 10 === 0 || completed === endpoints.length) {
-        progress?.(`Fetched ${completed}/${endpoints.length} models...`);
-      }
-      return model;
-    }),
-  );
-  return models.filter((model): model is DiscoveredModel => model !== undefined);
-}
+function mapFromWildcardExpansion(
+  entry: ModelsListEntry,
+  wildcards: readonly DiscoveredModel[],
+): DiscoveredModel | undefined {
+  const id = wireString(entry.id);
+  if (!id || id.includes("*")) return undefined;
+  const matches = wildcards.filter((model) => wildcardMatches(model.id, id));
+  if (matches.length === 0) return undefined;
 
-// Deployments of one public id that were mapped independently (the /health path fetches a
-// detail row per deployment) vote the same way the /model/info path does: any deployment
-// that needs Chat Completions keeps the whole route on Chat, so the result cannot depend on
-// the order the proxy listed them in.
-function deduplicateModels(models: DiscoveredModel[]): DiscoveredModel[] {
-  const entries = new Map<
-    string,
-    { model: DiscoveredModel; suppressions: boolean[]; chat: boolean; families: Set<string | undefined> }
-  >();
-  for (const model of models) {
-    const existing = entries.get(model.id);
-    const chat = model.api === "openai-completions";
-    if (existing) {
-      existing.suppressions.push(model.suppressReasoningContent === true);
-      // Once any deployment forces the group onto Chat Completions, base the merge on that
-      // deployment's own contextWindow/maxTokens/reasoning/cost — the profile requests will
-      // actually hit — rather than whichever deployment happened to be seen first.
-      if (chat && !existing.chat) existing.model = model;
-      existing.chat ||= chat;
-      existing.families.add(model.litellmBackendFamily);
-    } else {
-      entries.set(model.id, {
-        model,
-        suppressions: [model.suppressReasoningContent === true],
-        chat,
-        families: new Set([model.litellmBackendFamily]),
-      });
-    }
-  }
-  return [...entries.values()].map(({ model, suppressions, chat, families }) => {
-    const deduplicated = { ...model };
-    if (aggregateSuppressionEvidence(suppressions)) deduplicated.suppressReasoningContent = true;
-    else delete deduplicated.suppressReasoningContent;
-    if (chat) forceCompletions(deduplicated, model.id);
-    // The family gates the OpenAI-only tool-cap preflight; deployments that disagree cannot authorize it.
-    if (families.size !== 1) delete deduplicated.litellmBackendFamily;
-    return deduplicated;
-  });
+  const api = matches.every((model) => model.api === "openai-responses") ? "openai-responses" : "openai-completions";
+  const reasoning = matches.every((model) => model.reasoning);
+  const vision = matches.every((model) => model.input.includes("image"));
+  const contextWindow = Math.min(...matches.map((model) => model.contextWindow));
+  const maxTokens = Math.min(...matches.map((model) => model.maxTokens));
+  const thinkingLevelMap = reasoning
+    ? intersectThinkingLevelMaps(matches.map((model) => model.thinkingLevelMap))
+    : undefined;
+  const incomplete = matches.some((model) => model.name.endsWith(" (incomplete metadata)"));
+  const suppressReasoningContent =
+    !FORCED_THINKING_MODEL_PATTERN.test(id) &&
+    aggregateSuppressionEvidence(matches.map((model) => model.suppressReasoningContent === true));
+  // Preserve every known tier even when a sibling has incomplete metadata. Omitting
+  // a complete sibling's higher tier would understate the known worst-case rate;
+  // the incomplete marker continues to signal that the resulting envelope is partial.
+  const costTiers = conservativeCostTiers(matches.map((model) => model.cost));
+  return {
+    id,
+    name: incomplete ? `${id} (incomplete metadata)` : id,
+    reasoning,
+    ...(thinkingLevelMap ? { thinkingLevelMap } : {}),
+    input: vision ? ["text", "image"] : ["text"],
+    cost: {
+      input: Math.max(...matches.map((model) => model.cost.input)),
+      output: Math.max(...matches.map((model) => model.cost.output)),
+      cacheRead: Math.max(...matches.map((model) => model.cost.cacheRead)),
+      cacheWrite: Math.max(...matches.map((model) => model.cost.cacheWrite)),
+      ...(costTiers ? { tiers: costTiers } : {}),
+    },
+    contextWindow,
+    maxTokens,
+    ...(api === "openai-responses" ? { api, compat: responsesCompat(id) } : { api, compat: completionsCompat(id) }),
+    litellmDiscoveryVersion: LITELLM_DISCOVERY_VERSION,
+    ...(suppressReasoningContent ? { suppressReasoningContent: true } : {}),
+  };
 }
 
 export async function discoverModels(
@@ -551,40 +781,30 @@ export async function discoverModels(
   progress?.("Querying /model/info endpoint...");
   const infoResult = await fetchJson<ModelInfoResponse>(`${base}/model/info`, apiKey, options);
   if (infoResult.ok) {
-    const entries = new Map<string, ModelInfoEntry>();
-    const wildcardRows: ModelInfoEntry[] = [];
-    const suppressionEvidence = new Map<string, Set<boolean>>();
-    const protocolEvidence = new Map<string, Set<LiteLLMApi>>();
-    const backendFamilyEvidence = new Map<string, Set<string | undefined>>();
+    const groups = new Map<string, ModelInfoEntry[]>();
     for (const entry of infoResult.data.data ?? []) {
-      if (!entry.model_name) continue;
-      if (entry.model_name.includes("*")) wildcardRows.push(entry);
-      const previous = entries.get(entry.model_name);
-      const suppressions = suppressionEvidence.get(entry.model_name) ?? new Set<boolean>();
-      suppressions.add(shouldSuppressReasoningContent(entry.model_name, entry));
-      suppressionEvidence.set(entry.model_name, suppressions);
-      const protocols = protocolEvidence.get(entry.model_name) ?? new Set<LiteLLMApi>();
-      protocols.add(modelProtocol(entry.model_name, entry).api);
-      protocolEvidence.set(entry.model_name, protocols);
-      const backendFamilies = backendFamilyEvidence.get(entry.model_name) ?? new Set<string | undefined>();
-      backendFamilies.add(resolveBackendIdentity(entry)?.family);
-      backendFamilyEvidence.set(entry.model_name, backendFamilies);
-      entries.set(entry.model_name, {
-        ...previous,
-        ...entry,
-        model_info: { ...previous?.model_info, ...entry.model_info },
-      });
+      // A route without a readable public name cannot be grouped or addressed.
+      const route = wireString(entry.model_name);
+      if (!route) continue;
+      const group = groups.get(route) ?? [];
+      group.push(entry);
+      groups.set(route, group);
     }
-    let models = [...entries.entries()]
-      .map(([id, entry]) => {
-        const model = mapFromModelInfo(entry, aggregateSuppressionEvidence(suppressionEvidence.get(id)!));
-        if (!model) return undefined;
-        if (protocolEvidence.get(id)?.has("openai-completions")) forceCompletions(model, id);
-        const families = backendFamilyEvidence.get(id);
-        if (families?.size !== 1) delete model.litellmBackendFamily;
-        return model;
-      })
-      .filter((m): m is DiscoveredModel => m !== undefined);
+    const publicCatalog = await loadDiscoveryPublicCatalog(options);
+    const ambiguousRoutes: string[] = [];
+    const incompatibleModeRoutes: string[] = [];
+    const reducedGroups = [...groups.entries()].map(([route, group]) => {
+      if (hasMixedIncompatibleDeploymentModes(group)) incompatibleModeRoutes.push(route);
+      return {
+        route,
+        model: mapFromModelInfoGroup(group, publicCatalog, ambiguousRoutes),
+      };
+    });
+    let models = reducedGroups
+      .map(({ model }) => model)
+      .filter((model): model is DiscoveredModel => model !== undefined);
+    reportIncompatibleDeploymentModes(incompatibleModeRoutes);
+    reportAmbiguousCatalogAuthority(ambiguousRoutes);
     // LiteLLM's /model/info does NOT expand wildcard model_name entries (e.g.
     // "lemonade/*" backed by model: openai/* + check_provider_endpoint: true)
     // — it returns the literal wildcard only. The discovered ids live in
@@ -592,17 +812,36 @@ export async function discoverModels(
     // /v1/models and merge the expanded (non-wildcard) entries in, dropping the
     // raw wildcard row so it doesn't surface as a phantom model choice.
     // Ref: docs.litellm.ai/docs/proxy/model_discovery
-    if (models.some((m) => m.id.includes("*"))) {
-      progress?.("/model/info has wildcard entries, expanding via /v1/models...");
-      const publishedWildcardIds = new Set(models.filter((model) => model.id.includes("*")).map((model) => model.id));
+    const wildcardRoutes = reducedGroups.filter(({ route }) => route.includes("*"));
+    if (wildcardRoutes.length > 0) {
+      const wildcards = wildcardRoutes
+        .map(({ model }) => model)
+        .filter((model): model is DiscoveredModel => model !== undefined);
+      const droppedRoutes = reducedGroups.filter(({ model }) => model === undefined).map(({ route }) => route);
+      const wildcardRows = wildcardRoutes.flatMap(({ route }) => groups.get(route)!);
+      const publishedWildcardIds = new Set(wildcards.map((model) => model.id));
+      // Exact exclusions are bounded to the same public id: `/v1/models` lacks
+      // deployment identity, so a differently named id for that deployment is unknowable.
+      const droppedExactIds = new Set(droppedRoutes.filter((route) => !route.includes("*")));
+      const droppedWildcards = droppedRoutes.filter((route) => route.includes("*"));
+      // A wildcard row is not addressable. Remove it before expansion so a failed
+      // `/v1/models` request cannot leak the literal wildcard into the selector.
       models = models.filter((model) => !model.id.includes("*"));
+      progress?.("/model/info has wildcard entries, expanding via /v1/models...");
       const listResult = await fetchJson<ModelsListResponse>(`${base}/v1/models`, apiKey, options);
-      if (listResult.ok) {
+      if (listResult.ok && wildcards.length > 0) {
         const expanded = (listResult.data.data ?? [])
-          .map(mapFromModelsList)
-          .filter((m): m is DiscoveredModel => m !== undefined && !m.id.includes("*"))
-          .map((m) => applyWildcardEvidence(m, wildcardRows, publishedWildcardIds))
-          .filter((m): m is DiscoveredModel => m !== undefined);
+          .filter((entry) => {
+            const id = wireString(entry.id);
+            return (
+              id === undefined ||
+              (!droppedExactIds.has(id) && !droppedWildcards.some((route) => wildcardMatches(route, id)))
+            );
+          })
+          .map((entry) => mapFromWildcardExpansion(entry, wildcards))
+          .filter((model): model is DiscoveredModel => model !== undefined)
+          .map((model) => applyWildcardEvidence(model, wildcardRows, publishedWildcardIds))
+          .filter((model): model is DiscoveredModel => model !== undefined);
         const seen = new Set<string>(models.map((m) => m.id));
         models = [...models, ...expanded.filter((m) => !seen.has(m.id))];
       }

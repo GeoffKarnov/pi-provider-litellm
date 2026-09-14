@@ -73,8 +73,11 @@ export const allowedSourceModules = [
   "index",
   "mcp-tools",
   "protocols",
+  "model-groups",
   "provider",
+  "public-catalog",
   "skills",
+  "thinking-levels",
   "types",
 ];
 
