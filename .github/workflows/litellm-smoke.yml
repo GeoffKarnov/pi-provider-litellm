@@ -175,7 +175,7 @@ jobs:
                 mode: responses
                 supported_openai_params: [temperature, thinking]
               litellm_params:
-                model: anthropic/claude-3-5-sonnet
+                model: anthropic/claude-sonnet-4-6
                 api_base: http://host.docker.internal:8100
                 api_key: sk-vidaimock
                 allowed_openai_params: [thinking, reasoning_effort]

@@ -139,7 +139,7 @@ describe("LiteLLM smoke workflow", () => {
                 litellm_provider: anthropic
               litellm_params:`);
     expect(workflow).toContain("model: openai/gpt-4o-mini");
-    expect(workflow).toContain("model: anthropic/claude-3-5-sonnet");
+    expect(workflow).toContain("model: anthropic/claude-sonnet-4-6");
     expect(workflow.match(/^[ \t]*- model_name: grouped-vidaimock[ \t]*$/gm)).toHaveLength(2);
     expect(workflow).toContain('row.model_name === "grouped-vidaimock"');
     expect(workflow).toContain('=== "chat,responses"');
