@@ -25,7 +25,10 @@ const PROVIDER_FAMILIES: Readonly<Record<string, BackendFamily>> = {
   moonshot: "kimi",
   moonshotai: "kimi",
 };
-const OPENAI_FAMILY_PATTERN = /(?:^|[./_-])(?:openai|gpt|codex|o\d)(?:$|[./_:-])/i;
+// `o\d` (OpenAI's o1/o3/o4-mini reasoning models) is only trustworthy at the start of the id or
+// right after a provider path segment — an interior "-o1-" is as likely to be an unrelated
+// product's own version marker (e.g. "custom-o1-clone").
+const OPENAI_FAMILY_PATTERN = /(?:^|[./_-])(?:openai|gpt|codex)(?:$|[./_:-])|(?:^|\/)o\d(?:$|[./_:-])/i;
 
 export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
