@@ -28,12 +28,11 @@
   identity when a non-generic provider conflicts with the model prefix. Reduce every deployment before choosing
   transport, capabilities, limits, prices, or catalog authority; never shallow-merge duplicate route rows.
 - Keep catalog lookup provider-aware. Unqualified or conflicting identities must not scan every Pi provider catalog.
-- The `/v1/models` fallback and a health-only `/health` entry take protocol from the matching Pi catalog model:
-  `openai-responses` selects Responses, while every other or missing catalog API selects Chat. For a health-only entry,
-  the route name authorizes nothing but that catalog-supplied transport; levels stay denied and no catalog metadata is
-  granted. The `/v1/models` fallback may enrich its other metadata from that bounded catalog lookup.
-- ` (no metadata)` is the fallback-only cache enrichment marker. Reduced `/model/info` groups and health-only `/health`
-  entries use ` (incomplete metadata)`, which must remain ineligible for route-name cache enrichment.
+- Evidence-free `/v1/models` and wholly health-only `/health` groups take protocol and presentation metadata from
+  the bounded Pi catalog lookup. `openai-responses` selects Responses; other or missing catalog APIs select Chat.
+  A health-only row mixed with deployment details grants no catalog authority to that group.
+- ` (no metadata)` is the evidence-free fallback cache enrichment marker. Reduced `/model/info` groups and health
+  groups with deployment details use ` (incomplete metadata)`, which remains ineligible for route-name enrichment.
 - Keep `LITELLM_OFFLINE` and `LITELLM_DISCOVERY_TIMEOUT_MS` behavior compatible with README docs.
 - Stored Pi `/login litellm` credentials take precedence over `LITELLM_API_KEY`.
 - Pi stores discovered models in `models-store.json`; models.dev enrichment uses `litellm-models-dev.json` with a

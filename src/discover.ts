@@ -153,7 +153,9 @@ function supportsResponses(entry: ModelInfoEntry): boolean {
   // (litellm/responses/main.py, _bridges_to_chat_completions), so generic adapters remain eligible for Responses.
   if (!azureAdapter) return true;
 
-  const version = wireString(entry.litellm_params?.api_version)?.trim();
+  const apiVersion = entry.litellm_params?.api_version;
+  if (apiVersion != null && typeof apiVersion !== "string") return false;
+  const version = apiVersion?.trim();
   if (!version) return true;
   const date = version.match(/^(\d{4}-\d{2}-\d{2})(?:-preview)?$/)?.[1];
   return date !== undefined && date >= "2025-03-01";
@@ -530,9 +532,8 @@ function syntheticHealthRow(route: string): ModelInfoEntry {
   const catalogModel = findCatalogModel(route);
   return {
     model_name: route,
-    // The route name authorizes nothing but the transport, which the Pi catalog
-    // supplies for an evidence-free entry; levels stay denied and no catalog
-    // metadata is granted.
+    // When mixed with deployment details, a bare endpoint contributes only its
+    // catalog-supplied transport and cannot grant catalog metadata to the group.
     model_info: { mode: catalogModel?.api === "openai-responses" ? "responses" : "chat" },
   };
 }
@@ -569,6 +570,7 @@ async function discoverFromHealth(
   progress?.(`Discovered ${endpoints.length} model endpoints, fetching details...`);
   let completed = 0;
   const denyThinkingLevels = new Set<ModelInfoEntry>();
+  const syntheticRows = new Set<ModelInfoEntry>();
   const rows = await Promise.all(
     endpoints.map(async (endpoint) => {
       const healthRoute = wireString(endpoint.model);
@@ -589,7 +591,10 @@ async function discoverFromHealth(
           }
         }
       }
-      entry ??= healthRoute ? syntheticHealthRow(healthRoute) : undefined;
+      if (!entry && healthRoute) {
+        entry = syntheticHealthRow(healthRoute);
+        syntheticRows.add(entry);
+      }
       completed++;
       if (completed % 10 === 0 || completed === endpoints.length) {
         progress?.(`Fetched ${completed}/${endpoints.length} models...`);
@@ -605,12 +610,16 @@ async function discoverFromHealth(
     group.push(entry);
     groups.set(route, group);
   }
-  const publicCatalog = await loadDiscoveryPublicCatalog(options);
+  const publicCatalog = rows.some((entry) => entry && !syntheticRows.has(entry))
+    ? await loadDiscoveryPublicCatalog(options)
+    : undefined;
   const incompatibleModeRoutes: string[] = [];
   const models = [...groups.entries()]
     .map(([route, group]) => {
       if (hasMixedIncompatibleDeploymentModes(group)) incompatibleModeRoutes.push(route);
-      const model = mapFromModelInfoGroup(group, publicCatalog);
+      const model = group.every((entry) => syntheticRows.has(entry))
+        ? mapFromModelsList({ id: route })
+        : mapFromModelInfoGroup(group, publicCatalog);
       if (model && group.some((entry) => denyThinkingLevels.has(entry))) delete model.thinkingLevelMap;
       return model;
     })

@@ -1,6 +1,7 @@
 import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { getModel } from "@earendil-works/pi-ai/compat";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   buildCompat,
@@ -82,6 +83,14 @@ describe("normalizeBaseUrl", () => {
 });
 
 describe("modelProtocol", () => {
+  it("keeps an Azure deployment with a non-string API version on Chat", () => {
+    expect(
+      modelProtocol("opaque-route", {
+        litellm_params: { model: "azure/gpt-5", api_version: 20240101 as unknown as string },
+      }),
+    ).toMatchObject({ api: "openai-completions" });
+  });
+
   it("does not infer a deployment protocol from its public route name", () => {
     expect(modelProtocol("openai/gpt-5", { model_name: "openai/gpt-5" })).toEqual({
       api: "openai-completions",
@@ -272,7 +281,14 @@ describe("discoverModels via /model/info", () => {
       params: { model: "gpt-5.6-sol", custom_llm_provider: "chatgpt" },
     },
   ])("enriches a ChatGPT subscription alias while retaining $mode routing", async ({ mode, api, params }) => {
-    const entry = { model_name: "high", litellm_params: params, model_info: { mode } };
+    const entry = {
+      model_name: "high",
+      litellm_params: params,
+      model_info: {
+        mode,
+        supported_endpoints: [api === "openai-responses" ? "/v1/responses" : "/v1/chat/completions"],
+      },
+    };
     // The synchronous fallback must work even when public-catalog loading exceeds its budget.
     expect(resolveModelInfoCatalog(entry)).toMatchObject({
       provider: "chatgpt",
@@ -1622,7 +1638,7 @@ describe("discoverModels via /model/info", () => {
     const result = await discoverModels("https://litellm.example.com", "sk-test", { modelsDev: false });
 
     expect(result.models[0]).toMatchObject({ api: "openai-responses" });
-    expect(result.models[0]?.compat).toEqual({ supportsStore: false, cacheControlFormat: "anthropic" });
+    expect(result.models[0]?.compat).toBeUndefined();
   });
 
   it.each([
@@ -2249,7 +2265,7 @@ describe("discoverModels via /health", () => {
       cost: { input: 7, output: 9, cacheRead: 1, cacheWrite: 2 },
     });
     expect(result.models.find((model) => model.id === "private/priced-model")).toMatchObject({
-      name: "private/priced-model (incomplete metadata)",
+      name: "private/priced-model (no metadata)",
       input: ["text"],
       contextWindow: 128_000,
       maxTokens: 16_384,
@@ -3442,9 +3458,7 @@ describe("discoverModels response-mode models", () => {
     expect(result.models[0]).not.toHaveProperty("thinkingLevelMap");
   });
 
-  it("uses catalog protocol without catalog metadata for a health endpoint without deployment detail", async () => {
-    // No `model_id`, so the route name supplies protocol only. Capability, limit,
-    // price, and thinking-control authority remain unavailable.
+  it("uses Pi catalog protocol and presentation for a health endpoint without deployment detail", async () => {
     mockEndpoints({
       "/model/info": () => jsonResponse(404, {}),
       "/v1/models": () => jsonResponse(404, {}),
@@ -3452,19 +3466,21 @@ describe("discoverModels response-mode models", () => {
     });
 
     const result = await discoverModels("https://litellm.example.com", "sk-test", { modelsDev: false });
+    const catalog = getModel("openai", "gpt-5.5");
 
     expect(result.source).toBe("health");
     expect(result.models[0]).toMatchObject({
       id: "openai/gpt-5.5",
-      name: "openai/gpt-5.5 (incomplete metadata)",
+      name: catalog.name,
       api: "openai-responses",
-      reasoning: false,
-      input: ["text"],
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-      contextWindow: 128_000,
-      maxTokens: 16_384,
+      reasoning: catalog.reasoning,
+      thinkingLevelMap: catalog.thinkingLevelMap,
+      input: catalog.input,
+      cost: catalog.cost,
+      contextWindow: catalog.contextWindow,
+      maxTokens: catalog.maxTokens,
     });
-    expect(result.models[0]).not.toHaveProperty("thinkingLevelMap");
+    expect(result.models[0]).not.toHaveProperty("litellmBackendFamily");
   });
 
   it("keeps an unknown health-only id on Chat", async () => {
@@ -3478,7 +3494,7 @@ describe("discoverModels response-mode models", () => {
 
     expect(result.models[0]).toMatchObject({
       id: "unknown-health-route",
-      name: "unknown-health-route (incomplete metadata)",
+      name: "unknown-health-route (no metadata)",
       api: "openai-completions",
     });
   });
@@ -3824,17 +3840,16 @@ describe("discoverModels fallback to /health", () => {
     expect(result.models[1]).toMatchObject({
       // Neither route resolves in the Pi catalog, so both are evidence-free and
       // must say so rather than presenting default limits and zero cost as fact.
-      name: "anthropic/claude-3-5-sonnet (incomplete metadata)",
+      name: "anthropic/claude-3-5-sonnet (no metadata)",
       contextWindow: 128000,
       maxTokens: 16384,
       compat: { supportsStore: false, cacheControlFormat: "anthropic" },
     });
-    expect(result.models[0]?.name).toBe("azure/gpt-35-turbo (incomplete metadata)");
+    expect(result.models[0]?.name).toBe("azure/gpt-35-turbo (no metadata)");
   });
 
-  it("marks all health-only routes incomplete while using catalog protocol evidence", async () => {
-    // `/health` route text is never authorized for metadata enrichment, so every
-    // route carries the permanent marker rather than the `/v1/models` sentinel.
+  it("uses bounded Pi metadata for health-only routes", async () => {
+    // Bare health entries use the same bounded Pi lookup as `/v1/models`.
     mockEndpoints({
       "/model/info": () => jsonResponse(404, {}),
       "/v1/models": () => jsonResponse(404, {}),
@@ -3850,15 +3865,40 @@ describe("discoverModels fallback to /health", () => {
     const [unresolved, resolved] = result.models;
     expect(unresolved).toMatchObject({
       id: "totally-unknown-route",
-      name: "totally-unknown-route (incomplete metadata)",
+      name: "totally-unknown-route (no metadata)",
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
       contextWindow: 128_000,
       maxTokens: 16_384,
     });
-    expect(unresolved?.name).not.toContain(" (no metadata)");
+    expect(unresolved?.name).toContain(" (no metadata)");
     expect(resolved).toMatchObject({
-      name: "anthropic/claude-opus-4-7 (incomplete metadata)",
+      name: getModel("anthropic", "claude-opus-4-7").name,
       api: "openai-completions",
+      cost: getModel("anthropic", "claude-opus-4-7").cost,
+    });
+  });
+
+  it("keeps mixed detailed and bare health rows conservative", async () => {
+    mockEndpoints({
+      "/model/info": () => jsonResponse(404, {}),
+      "/v1/models": () => jsonResponse(404, {}),
+      "/health": () =>
+        jsonResponse(200, {
+          healthy_endpoints: [{ model: "openai/gpt-5.5", model_id: "detail" }, { model: "openai/gpt-5.5" }],
+        }),
+      "/model/info?litellm_model_id=detail": () =>
+        jsonResponse(200, {
+          data: [{ model_name: "openai/gpt-5.5", litellm_params: { model: "private/unknown" } }],
+        }),
+    });
+
+    const result = await discoverModels("https://litellm.example.com", "sk-test", { modelsDev: false });
+
+    expect(result.models[0]).toMatchObject({
+      name: "openai/gpt-5.5 (incomplete metadata)",
+      reasoning: false,
+      contextWindow: 128_000,
+      maxTokens: 16_384,
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     });
   });
