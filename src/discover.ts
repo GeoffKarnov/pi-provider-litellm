@@ -401,16 +401,20 @@ export function wildcardMatches(route: string, modelId: string): boolean {
 // child actually runs on names that concrete backend model.
 function resolveWildcardRow(row: ModelInfoEntry, modelId: string): ModelInfoEntry {
   const route = row.model_name ?? "";
-  const star = route.indexOf("*");
   const backend = row.litellm_params?.model;
-  if (star < 0 || !backend?.includes("*")) return { ...row, model_name: modelId };
-  const prefix = route.slice(0, star);
-  const suffix = route.slice(route.lastIndexOf("*") + 1);
-  const matched = modelId.slice(prefix.length, modelId.length - suffix.length);
+  if (!route.includes("*") || !backend?.includes("*")) return { ...row, model_name: modelId };
+  // Capture each `*` segment of the route against modelId, then substitute those captures
+  // positionally into the backend's own wildcards, so a route with 2+ stars (e.g. "team/*-*")
+  // resolves every star instead of only the first.
+  const escaped = route.split("*").map((segment) => segment.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+  const match = modelId.match(new RegExp(`^${escaped.join("(.*)")}$`));
+  if (!match) return { ...row, model_name: modelId };
+  const captures = match.slice(1);
+  let index = 0;
   return {
     ...row,
     model_name: modelId,
-    litellm_params: { ...row.litellm_params, model: backend.replace("*", matched) },
+    litellm_params: { ...row.litellm_params, model: backend.replace(/\*/g, () => captures[index++] ?? "") },
   };
 }
 
