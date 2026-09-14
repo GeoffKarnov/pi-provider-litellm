@@ -109,7 +109,7 @@ async function setupAdcProvider(adc: unknown | undefined): Promise<{
   const adcPath = join(agentDir, "adc.json");
   if (adc !== undefined) await writeFile(adcPath, JSON.stringify(adc), "utf8");
   process.env.GOOGLE_APPLICATION_CREDENTIALS = adcPath;
-  process.env.LITELLM_BASE_URL = "https://litellm.example.com";
+  process.env.LITELLM_BASE_URL = "https://proxy.example.com";
   process.env.LITELLM_GCLOUD_TOKEN_AUTH = "1";
   process.env.LITELLM_DISCOVERY_TIMEOUT_MS = "0";
 
