@@ -384,20 +384,27 @@ describe("probeDiscovery", () => {
     expect(signals[0]).toBeInstanceOf(AbortSignal);
   });
 
-  it("reports a /v1/models fallback discovery from route-only rows", async () => {
+  it.each([
+    ["models_list", 401, ""],
+    ["models_list", 403, "Forbidden"],
+    ["models_list", 404, "<html>Not found</html>"],
+    ["health", 404, "<html>Not found</html>"],
+  ] as const)("reports %s fallback after non-JSON %i model info", async (source, status, body) => {
     const dir = await mkdtemp(join(tmpdir(), "probe-fallback-info-"));
     const sourceDir = join(dir, "src");
     await mkdir(sourceDir);
     await writeFile(
       join(sourceDir, "discover.ts"),
-      'export async function discoverModels() { return { source: "models_list", models: [{ id: "route-gpt", api: "openai-completions", reasoning: false, contextWindow: 1000, maxTokens: 100, cost: {} }] }; }\n',
+      `export async function discoverModels() { return { source: "${source}", models: [{ id: "route-gpt", api: "openai-completions", reasoning: false, contextWindow: 1000, maxTokens: 100, cost: {} }] }; }\n`,
     );
-    vi.stubGlobal("fetch", async () => new Response(JSON.stringify({ error: "unauthorized" }), { status: 401 }));
+    const fetch = vi.fn(async (_input: string | URL | Request) => new Response(body, { status }));
+    vi.stubGlobal("fetch", fetch);
 
     const report = await probeDiscovery({ baseUrl: "https://proxy.example/v1", apiKey: "secret", src: dir });
 
-    expect(report.source).toBe("models_list");
+    expect(report.source).toBe(source);
     expect(report.models).toMatchObject([{ id: "route-gpt", deployments: 1, publicSources: [] }]);
+    expect(fetch.mock.calls.some(([url]) => String(url).endsWith("/model/info"))).toBe(false);
   });
 
   it("injects snapshot fetch and reports identity, flags, selected metadata, and predictions", async () => {

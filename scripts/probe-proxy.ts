@@ -288,10 +288,12 @@ export async function probeDiscovery(options: ProbeOptions): Promise<ProbeReport
     const discovery = await discoverModels(baseUrl, apiKey, { silent: true, modelsDev: snapshot ? false : undefined });
     const rawInfo = snapshot
       ? snapshot.modelInfo
-      : await originalFetch(`${baseUrl.replace(/\/+$/, "")}/model/info`, {
-          headers: { Authorization: `Bearer ${apiKey}`, Accept: "application/json" },
-          signal: AbortSignal.timeout(30_000),
-        }).then((response) => response.json());
+      : discovery.source === "model_info"
+        ? await originalFetch(`${baseUrl.replace(/\/+$/, "")}/model/info`, {
+            headers: { Authorization: `Bearer ${apiKey}`, Accept: "application/json" },
+            signal: AbortSignal.timeout(30_000),
+          }).then((response) => response.json())
+        : undefined;
     const rows = rowsFrom(rawInfo);
     // Discovery that fell back to /v1/models or /health is reported from route-only rows; only a
     // /model/info discovery is contradicted by an empty second read of the same endpoint.
