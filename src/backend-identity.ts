@@ -33,12 +33,9 @@ const KNOWN_VENDOR_PREFIXES = new Set([...Object.keys(PROVIDER_FAMILIES), "opena
 // product's own version marker (e.g. "custom-o1-clone").
 const OPENAI_FAMILY_PATTERN = /(?:^|[./_-])(?:openai|gpt|codex)(?:$|[./_:-])|(?:^|\/)o\d(?:$|[./_:-])/i;
 
-export function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
 function wireString(value: unknown): string | undefined {
-  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+  const trimmed = typeof value === "string" ? value.trim() : undefined;
+  return trimmed && trimmed !== "undefined" ? trimmed : undefined;
 }
 
 function semanticFamily(id: string): BackendFamily | undefined {
