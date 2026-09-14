@@ -1,4 +1,6 @@
+import { createHash } from "node:crypto";
 import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { request as httpRequest } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -147,15 +149,21 @@ async function loginOAuth(
     onAuth?: (event: { url: string; instructions?: string }) => void;
     onDeviceCode?: (event: { userCode: string; verificationUri: string; expiresInSeconds?: number }) => void;
     onProgress?: (message: string) => void;
+    pkce?: true;
     signal?: AbortSignal;
   },
 ) {
   const fetchImpl = globalThis.fetch;
-  if (!callbacks.onDeviceCode)
-    globalThis.fetch = (input, init) =>
-      String(input).endsWith("/sso/cli/start")
-        ? Promise.resolve(jsonResponse(404, { detail: "Not Found" }))
-        : fetchImpl(input, init);
+  globalThis.fetch = (input, init) => {
+    const url = String(input);
+    if (!callbacks.pkce && url.endsWith("/.well-known/litellm-cli-auth")) {
+      return Promise.resolve(jsonResponse(404, { detail: "Not Found" }));
+    }
+    if (!callbacks.onDeviceCode && url.endsWith("/sso/cli/start")) {
+      return Promise.resolve(jsonResponse(404, { detail: "Not Found" }));
+    }
+    return fetchImpl(input, init);
+  };
   try {
     return await provider.auth.oauth?.login(
       interaction(
@@ -1484,6 +1492,610 @@ describe("extension startup", () => {
     expect(seenRequests.every(({ url }) => !url.endsWith("/model/info"))).toBe(true);
   });
 
+  it("completes native PKCE login", async () => {
+    const agentDir = await makeAgentDir();
+    process.env.LITELLM_DISCOVERY_TIMEOUT_MS = "0";
+    const requests: Array<{ url: string; method: string; redirect?: RequestInit["redirect"]; body?: string }> = [];
+    let registrationBody: Record<string, unknown> | undefined;
+    let authorizationUrl: URL | undefined;
+    let tokenForm: URLSearchParams | undefined;
+    let discoveryRequest: { redirect?: RequestInit["redirect"] } | undefined;
+    let tokenRequest: { redirect?: RequestInit["redirect"] } | undefined;
+    let callbackResponse: Promise<Response> | undefined;
+    const nativeFetch = globalThis.fetch;
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = String(init?.method ?? "GET");
+      if (url.startsWith("http://127.0.0.1:")) return nativeFetch(input, init);
+      requests.push({
+        url,
+        method,
+        redirect: init?.redirect,
+        body: typeof init?.body === "string" ? init.body : undefined,
+      });
+      if (url.endsWith("/.well-known/litellm-cli-auth")) {
+        discoveryRequest = { redirect: init?.redirect };
+        return jsonResponse(200, {
+          contract_version: 1,
+          issuer: "https://litellm.example.com",
+          authorization_endpoint: "https://litellm.example.com/authorize",
+          token_endpoint: "https://litellm.example.com/token",
+          registration_endpoint: "https://litellm.example.com/register",
+          resource: "https://litellm.example.com",
+          code_challenge_methods_supported: ["S256"],
+        });
+      }
+      if (url.endsWith("/register")) {
+        registrationBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        return jsonResponse(201, {
+          client_id: "llm_dcrc_client",
+          redirect_uris: registrationBody.redirect_uris,
+        });
+      }
+      if (url.endsWith("/token")) {
+        tokenRequest = { redirect: init?.redirect };
+        tokenForm = new URLSearchParams(String(init?.body));
+        return jsonResponse(200, {
+          access_token: "access-new",
+          refresh_token: "refresh-new",
+          token_type: "Bearer",
+          expires_in: 3600,
+          user_id: "user@example.com",
+          team_id: "team-a",
+        });
+      }
+      throw new Error(`unexpected URL: ${url} (${method})`);
+    });
+    const extension = await loadExtension(agentDir);
+    const pi = createPi();
+    await extension(pi);
+    const startedAt = Date.now();
+    const credential = await loginOAuth(pi.providers[0]!, {
+      onPrompt: async (prompt) => (prompt.placeholder ? "https://litellm.example.com" : ""),
+      onAuth: ({ url }) => {
+        authorizationUrl = new URL(url);
+        callbackResponse = fetch(
+          `${new URL(url).searchParams.get("redirect_uri")}?code=authorization-code&state=${new URL(url).searchParams.get("state")}`,
+        );
+      },
+      pkce: true,
+      signal: new AbortController().signal,
+    });
+    const endedAt = Date.now();
+
+    expect(discoveryRequest?.redirect).toBe("manual");
+    expect(registrationBody).toMatchObject({
+      client_name: "pi-provider-litellm",
+      redirect_uris: [expect.stringMatching(/^http:\/\/127\.0\.0\.1:\d+\/callback$/)],
+      token_endpoint_auth_method: "none",
+      grant_types: ["authorization_code", "refresh_token"],
+      response_types: ["code"],
+    });
+    expect(authorizationUrl?.searchParams.get("resource")).toBe("https://litellm.example.com");
+    const verifier = tokenForm?.get("code_verifier");
+    expect(verifier).toEqual(expect.any(String));
+    expect(
+      createHash("sha256")
+        .update(verifier ?? "")
+        .digest("base64url"),
+    ).toBe(authorizationUrl?.searchParams.get("code_challenge"));
+    const registeredRedirectUris = Array.isArray(registrationBody?.redirect_uris) ? registrationBody.redirect_uris : [];
+    expect(tokenForm?.get("redirect_uri")).toBe(registeredRedirectUris[0]);
+    expect(tokenRequest?.redirect).toBe("manual");
+    expect((await callbackResponse)?.status).toBe(200);
+    expect((await callbackResponse)?.headers.get("cache-control")).toBe("no-store");
+    expect(await (await callbackResponse)?.text()).toContain("close this window");
+    expect(credential).toMatchObject({
+      type: "oauth",
+      access: "access-new",
+      refresh: "refresh-new",
+      baseUrl: "https://litellm.example.com",
+      flow: "litellm_cli_pkce",
+      clientId: "llm_dcrc_client",
+      tokenEndpoint: "https://litellm.example.com/token",
+      resource: "https://litellm.example.com",
+      userId: "user@example.com",
+      teamId: "team-a",
+    });
+    expect(credential?.expires).toBeGreaterThanOrEqual(startedAt + 3_600_000);
+    expect(credential?.expires).toBeLessThanOrEqual(endedAt + 3_600_000);
+    expect(requests.some((request) => request.url.endsWith("/sso/cli/start"))).toBe(false);
+  }, 15_000);
+
+  it.each([
+    ["an unsupported contract version", { contract_version: 2 }],
+    ["no S256 support", { code_challenge_methods_supported: ["plain"] }],
+    ["a different issuer", { issuer: "https://other.example.com" }],
+    ["issuer credentials", { issuer: "https://secret@litellm.example.com" }],
+    ["an issuer query", { issuer: "https://litellm.example.com?tenant=other" }],
+    ["token endpoint credentials", { token_endpoint: "https://secret@litellm.example.com/token" }],
+    ["a token endpoint fragment", { token_endpoint: "https://litellm.example.com/token#other" }],
+    ["a cross-origin authorization endpoint", { authorization_endpoint: "https://other.example.com/authorize" }],
+    ["a cross-origin token endpoint", { token_endpoint: "https://other.example.com/token" }],
+    ["a cross-origin registration endpoint", { registration_endpoint: "https://other.example.com/register" }],
+    ["a cross-origin resource", { resource: "https://other.example.com" }],
+  ])("rejects native PKCE discovery with %s", async (_name, override) => {
+    const agentDir = await makeAgentDir();
+    process.env.LITELLM_DISCOVERY_TIMEOUT_MS = "0";
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      if (String(input).endsWith("/.well-known/litellm-cli-auth"))
+        return jsonResponse(200, {
+          contract_version: 1,
+          issuer: "https://litellm.example.com",
+          authorization_endpoint: "https://litellm.example.com/authorize",
+          token_endpoint: "https://litellm.example.com/token",
+          registration_endpoint: "https://litellm.example.com/register",
+          resource: "https://litellm.example.com",
+          code_challenge_methods_supported: ["S256"],
+          ...override,
+        });
+      throw new Error(`unexpected URL: ${String(input)}`);
+    });
+    const extension = await loadExtension(agentDir);
+    const pi = createPi();
+    await extension(pi);
+
+    await expect(
+      loginOAuth(pi.providers[0]!, {
+        onPrompt: async (prompt) => (prompt.placeholder ? "https://litellm.example.com" : ""),
+        pkce: true,
+        signal: new AbortController().signal,
+      }),
+    ).rejects.toThrow();
+    expect(fetchMock.mock.calls.some(([input]) => String(input).endsWith("/register"))).toBe(false);
+  });
+
+  it("does not follow PKCE discovery redirects", async () => {
+    const agentDir = await makeAgentDir();
+    process.env.LITELLM_DISCOVERY_TIMEOUT_MS = "0";
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(null, {
+        status: 302,
+        headers: { location: "https://other.example.com/.well-known/litellm-cli-auth" },
+      }),
+    );
+    const extension = await loadExtension(agentDir);
+    const pi = createPi();
+    await extension(pi);
+
+    await expect(
+      loginOAuth(pi.providers[0]!, {
+        onPrompt: async (prompt) => (prompt.placeholder ? "https://litellm.example.com" : ""),
+        pkce: true,
+        signal: new AbortController().signal,
+      }),
+    ).rejects.toThrow("LiteLLM CLI auth discovery failed (HTTP 302)");
+    expect(fetchMock.mock.calls[0]?.[1]?.redirect).toBe("manual");
+  });
+
+  it.each(["non-GET", "malformed URL"])("rejects %s native PKCE callbacks", async (kind) => {
+    const agentDir = await makeAgentDir();
+    process.env.LITELLM_DISCOVERY_TIMEOUT_MS = "0";
+    const nativeFetch = globalThis.fetch;
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (url.startsWith("http://127.0.0.1:")) return nativeFetch(input, init);
+      if (url.endsWith("/.well-known/litellm-cli-auth"))
+        return jsonResponse(200, {
+          contract_version: 1,
+          issuer: "https://litellm.example.com",
+          authorization_endpoint: "https://litellm.example.com/authorize",
+          token_endpoint: "https://litellm.example.com/token",
+          registration_endpoint: "https://litellm.example.com/register",
+          resource: "https://litellm.example.com",
+          code_challenge_methods_supported: ["S256"],
+        });
+      if (url.endsWith("/register"))
+        return jsonResponse(200, {
+          client_id: "llm_dcrc_client",
+          redirect_uris: JSON.parse(String(init?.body)).redirect_uris,
+        });
+      if (url.endsWith("/token"))
+        return jsonResponse(200, {
+          access_token: "access-new",
+          refresh_token: "refresh-new",
+          token_type: "Bearer",
+          expires_in: 3600,
+        });
+      throw new Error(`unexpected URL: ${url}`);
+    });
+    const extension = await loadExtension(agentDir);
+    const pi = createPi();
+    await extension(pi);
+    const controller = new AbortController();
+    const reason = new Error("caller cancelled login");
+    let callbackResponse: Promise<{ status: number }> | undefined;
+    const login = loginOAuth(pi.providers[0]!, {
+      onPrompt: async (prompt) => (prompt.placeholder ? "https://litellm.example.com" : ""),
+      onAuth: ({ url }) => {
+        const authorizationUrl = new URL(url);
+        const redirectUri = new URL(authorizationUrl.searchParams.get("redirect_uri")!);
+        callbackResponse =
+          kind === "non-GET"
+            ? fetch(`${redirectUri}?state=${authorizationUrl.searchParams.get("state")}&code=authorization-code`, {
+                method: "POST",
+              })
+            : new Promise((resolve, reject) => {
+                const request = httpRequest(
+                  { hostname: redirectUri.hostname, port: redirectUri.port, path: "http://[" },
+                  (response) => {
+                    response.resume();
+                    resolve({ status: response.statusCode! });
+                  },
+                );
+                request.on("error", reject);
+                request.setTimeout(1000, () => request.destroy(new Error("Callback did not reject malformed URL")));
+                request.end();
+              });
+      },
+      pkce: true,
+      signal: controller.signal,
+    });
+    await vi.waitFor(() => expect(callbackResponse).toBeDefined());
+    expect((await callbackResponse)?.status).toBe(kind === "non-GET" ? 405 : 400);
+    controller.abort(reason);
+    await expect(login).rejects.toBe(reason);
+  });
+
+  it("surfaces an OAuth denial from the native PKCE callback", async () => {
+    const agentDir = await makeAgentDir();
+    process.env.LITELLM_DISCOVERY_TIMEOUT_MS = "0";
+    const nativeFetch = globalThis.fetch;
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (url.startsWith("http://127.0.0.1:")) return nativeFetch(input, init);
+      if (url.endsWith("/.well-known/litellm-cli-auth"))
+        return jsonResponse(200, {
+          contract_version: 1,
+          issuer: "https://litellm.example.com",
+          authorization_endpoint: "https://litellm.example.com/authorize",
+          token_endpoint: "https://litellm.example.com/token",
+          registration_endpoint: "https://litellm.example.com/register",
+          resource: "https://litellm.example.com",
+          code_challenge_methods_supported: ["S256"],
+        });
+      if (url.endsWith("/register"))
+        return jsonResponse(200, {
+          client_id: "llm_dcrc_client",
+          redirect_uris: JSON.parse(String(init?.body)).redirect_uris,
+        });
+      throw new Error(`unexpected URL: ${url}`);
+    });
+    const extension = await loadExtension(agentDir);
+    const pi = createPi();
+    await extension(pi);
+
+    await expect(
+      loginOAuth(pi.providers[0]!, {
+        onPrompt: async (prompt) => (prompt.placeholder ? "https://litellm.example.com" : ""),
+        onAuth: ({ url }) => {
+          const authorizationUrl = new URL(url);
+          void fetch(
+            `${authorizationUrl.searchParams.get("redirect_uri")}?state=${authorizationUrl.searchParams.get("state")}&error=access_denied&error_description=User%20declined`,
+          );
+        },
+        pkce: true,
+        signal: new AbortController().signal,
+      }),
+    ).rejects.toThrow("LiteLLM PKCE login was denied");
+  });
+
+  it.each(["registration", "token"])("does not follow native PKCE %s redirects", async (stage) => {
+    const agentDir = await makeAgentDir();
+    process.env.LITELLM_DISCOVERY_TIMEOUT_MS = "0";
+    const nativeFetch = globalThis.fetch;
+    const redirects: NonNullable<RequestInit["redirect"]>[] = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (url.startsWith("http://127.0.0.1:")) return nativeFetch(input, init);
+      if (url.endsWith("/.well-known/litellm-cli-auth"))
+        return jsonResponse(200, {
+          contract_version: 1,
+          issuer: "https://litellm.example.com",
+          authorization_endpoint: "https://litellm.example.com/authorize",
+          token_endpoint: "https://litellm.example.com/token",
+          registration_endpoint: "https://litellm.example.com/register",
+          resource: "https://litellm.example.com",
+          code_challenge_methods_supported: ["S256"],
+        });
+      if (url.endsWith("/register")) {
+        redirects.push(init?.redirect ?? "follow");
+        if (stage === "registration")
+          return new Response(null, { status: 302, headers: { location: "/register-next" } });
+        return jsonResponse(200, {
+          client_id: "llm_dcrc_client",
+          redirect_uris: JSON.parse(String(init?.body)).redirect_uris,
+        });
+      }
+      if (url.endsWith("/token")) {
+        redirects.push(init?.redirect ?? "follow");
+        return new Response(null, { status: 302, headers: { location: "/token-next" } });
+      }
+      throw new Error(`unexpected URL: ${url}`);
+    });
+    const extension = await loadExtension(agentDir);
+    const pi = createPi();
+    await extension(pi);
+
+    await expect(
+      loginOAuth(pi.providers[0]!, {
+        onPrompt: async (prompt) => (prompt.placeholder ? "https://litellm.example.com" : ""),
+        onAuth: ({ url }) => {
+          const authorizationUrl = new URL(url);
+          void fetch(
+            `${authorizationUrl.searchParams.get("redirect_uri")}?state=${authorizationUrl.searchParams.get("state")}&code=authorization-code`,
+          );
+        },
+        pkce: true,
+        signal: new AbortController().signal,
+      }),
+    ).rejects.toThrow(
+      stage === "registration" ? "client registration failed (HTTP 302)" : "token exchange failed (HTTP 302)",
+    );
+    expect(redirects).toEqual(stage === "registration" ? ["manual"] : ["manual", "manual"]);
+  });
+
+  it("reports a transient native PKCE token network failure", async () => {
+    const agentDir = await makeAgentDir();
+    process.env.LITELLM_DISCOVERY_TIMEOUT_MS = "0";
+    const nativeFetch = globalThis.fetch;
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (url.startsWith("http://127.0.0.1:")) return nativeFetch(input, init);
+      if (url.endsWith("/.well-known/litellm-cli-auth"))
+        return jsonResponse(200, {
+          contract_version: 1,
+          issuer: "https://litellm.example.com",
+          authorization_endpoint: "https://litellm.example.com/authorize",
+          token_endpoint: "https://litellm.example.com/token",
+          registration_endpoint: "https://litellm.example.com/register",
+          resource: "https://litellm.example.com",
+          code_challenge_methods_supported: ["S256"],
+        });
+      if (url.endsWith("/register"))
+        return jsonResponse(200, {
+          client_id: "llm_dcrc_client",
+          redirect_uris: JSON.parse(String(init?.body)).redirect_uris,
+        });
+      if (url.endsWith("/token")) throw new Error("network offline");
+      throw new Error(`unexpected URL: ${url}`);
+    });
+    const extension = await loadExtension(agentDir);
+    const pi = createPi();
+    await extension(pi);
+
+    await expect(
+      loginOAuth(pi.providers[0]!, {
+        onPrompt: async (prompt) => (prompt.placeholder ? "https://litellm.example.com" : ""),
+        onAuth: ({ url }) => {
+          const authorizationUrl = new URL(url);
+          void fetch(
+            `${authorizationUrl.searchParams.get("redirect_uri")}?state=${authorizationUrl.searchParams.get("state")}&code=authorization-code`,
+          );
+        },
+        pkce: true,
+        signal: new AbortController().signal,
+      }),
+    ).rejects.toThrow("LiteLLM token exchange failed (network error)");
+  });
+
+  it.each<[string, number, unknown, string]>([
+    ["a malformed response", 200, {}, "LiteLLM token exchange returned an invalid response"],
+    ...[{ access_token: " " }, { refresh_token: "refresh\nsecret" }, { expires_in: 1e308 }].map(
+      (override): [string, number, unknown, string] => [
+        `an invalid ${Object.keys(override)[0]}`,
+        200,
+        { access_token: "access", refresh_token: "refresh", token_type: "Bearer", expires_in: 3600, ...override },
+        "LiteLLM token exchange returned an invalid response",
+      ],
+    ),
+    [
+      "an OAuth error",
+      400,
+      { error: "invalid_grant", error_description: "authorization-code\nsecret\u001b[31m" },
+      "LiteLLM token exchange rejected (invalid_grant)",
+    ],
+    ["a 429 response", 429, {}, "LiteLLM token exchange failed (HTTP 429)"],
+    ["a 500 response", 500, {}, "LiteLLM token exchange failed (HTTP 500)"],
+  ])("surfaces native PKCE token %s", async (_name, status, body, message) => {
+    const agentDir = await makeAgentDir();
+    process.env.LITELLM_DISCOVERY_TIMEOUT_MS = "0";
+    const nativeFetch = globalThis.fetch;
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (url.startsWith("http://127.0.0.1:")) return nativeFetch(input, init);
+      if (url.endsWith("/.well-known/litellm-cli-auth"))
+        return jsonResponse(200, {
+          contract_version: 1,
+          issuer: "https://litellm.example.com",
+          authorization_endpoint: "https://litellm.example.com/authorize",
+          token_endpoint: "https://litellm.example.com/token",
+          registration_endpoint: "https://litellm.example.com/register",
+          resource: "https://litellm.example.com",
+          code_challenge_methods_supported: ["S256"],
+        });
+      if (url.endsWith("/register"))
+        return jsonResponse(200, {
+          client_id: "llm_dcrc_client",
+          redirect_uris: JSON.parse(String(init?.body)).redirect_uris,
+        });
+      if (url.endsWith("/token")) return jsonResponse(status, body);
+      throw new Error(`unexpected URL: ${url}`);
+    });
+    const extension = await loadExtension(agentDir);
+    const pi = createPi();
+    await extension(pi);
+
+    await expect(
+      loginOAuth(pi.providers[0]!, {
+        onPrompt: async (prompt) => (prompt.placeholder ? "https://litellm.example.com" : ""),
+        onAuth: ({ url }) => {
+          const authorizationUrl = new URL(url);
+          void fetch(
+            `${authorizationUrl.searchParams.get("redirect_uri")}?state=${authorizationUrl.searchParams.get("state")}&code=authorization-code`,
+          );
+        },
+        pkce: true,
+        signal: new AbortController().signal,
+      }),
+    ).rejects.toThrow(message);
+  });
+
+  it("keeps waiting after a native PKCE callback with the wrong state", async () => {
+    const agentDir = await makeAgentDir();
+    process.env.LITELLM_DISCOVERY_TIMEOUT_MS = "0";
+    const nativeFetch = globalThis.fetch;
+    let wrongStateResponse: Promise<Response> | undefined;
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (url.startsWith("http://127.0.0.1:")) return nativeFetch(input, init);
+      if (url.endsWith("/.well-known/litellm-cli-auth"))
+        return jsonResponse(200, {
+          contract_version: 1,
+          issuer: "https://litellm.example.com",
+          authorization_endpoint: "https://litellm.example.com/authorize",
+          token_endpoint: "https://litellm.example.com/token",
+          registration_endpoint: "https://litellm.example.com/register",
+          resource: "https://litellm.example.com",
+          code_challenge_methods_supported: ["S256"],
+        });
+      if (url.endsWith("/register"))
+        return jsonResponse(200, {
+          client_id: "llm_dcrc_client",
+          redirect_uris: JSON.parse(String(init?.body)).redirect_uris,
+        });
+      if (url.endsWith("/token"))
+        return jsonResponse(200, {
+          access_token: "access-new",
+          refresh_token: "refresh-new",
+          token_type: "Bearer",
+          expires_in: 3600,
+        });
+      throw new Error(`unexpected URL: ${url}`);
+    });
+    const extension = await loadExtension(agentDir);
+    const pi = createPi();
+    await extension(pi);
+
+    const credential = await loginOAuth(pi.providers[0]!, {
+      onPrompt: async (prompt) => (prompt.placeholder ? "https://litellm.example.com" : ""),
+      onAuth: ({ url }) => {
+        const authorizationUrl = new URL(url);
+        const redirectUri = authorizationUrl.searchParams.get("redirect_uri");
+        wrongStateResponse = fetch(`${redirectUri}?state=wrong&code=wrong-code`);
+        void fetch(`${redirectUri}?state=${authorizationUrl.searchParams.get("state")}&code=authorization-code`);
+      },
+      pkce: true,
+      signal: new AbortController().signal,
+    });
+    expect((await wrongStateResponse)?.status).toBe(400);
+    expect(credential).toMatchObject({ access: "access-new" });
+  });
+
+  it("closes the native PKCE callback listener when login is aborted", async () => {
+    const agentDir = await makeAgentDir();
+    process.env.LITELLM_DISCOVERY_TIMEOUT_MS = "0";
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (url.endsWith("/.well-known/litellm-cli-auth"))
+        return jsonResponse(200, {
+          contract_version: 1,
+          issuer: "https://litellm.example.com",
+          authorization_endpoint: "https://litellm.example.com/authorize",
+          token_endpoint: "https://litellm.example.com/token",
+          registration_endpoint: "https://litellm.example.com/register",
+          resource: "https://litellm.example.com",
+          code_challenge_methods_supported: ["S256"],
+        });
+      if (url.endsWith("/register"))
+        return jsonResponse(200, {
+          client_id: "llm_dcrc_client",
+          redirect_uris: JSON.parse(String(init?.body)).redirect_uris,
+        });
+      throw new Error(`unexpected URL: ${url}`);
+    });
+    const extension = await loadExtension(agentDir);
+    const pi = createPi();
+    await extension(pi);
+    const controller = new AbortController();
+    const reason = new Error("caller cancelled login");
+    let callbackUrl: string | undefined;
+    const login = loginOAuth(pi.providers[0]!, {
+      onPrompt: async (prompt) => (prompt.placeholder ? "https://litellm.example.com" : ""),
+      onAuth: ({ url }) => {
+        callbackUrl = new URL(url).searchParams.get("redirect_uri")!;
+      },
+      pkce: true,
+      signal: controller.signal,
+    });
+    await vi.waitFor(() => expect(callbackUrl).toBeDefined());
+    controller.abort(reason);
+    await expect(login).rejects.toBe(reason);
+    await expect(fetch(`${callbackUrl}?code=authorization-code`)).rejects.toThrow();
+  });
+
+  it.each([
+    ["success", undefined],
+    ["OAuth denial", "LiteLLM PKCE login was denied"],
+    ["registration failure", "LiteLLM PKCE client registration failed (HTTP 500)"],
+    ["token failure", "LiteLLM token exchange failed (HTTP 500)"],
+  ])("closes the native PKCE callback listener after %s", async (outcome, expectedError) => {
+    const agentDir = await makeAgentDir();
+    process.env.LITELLM_DISCOVERY_TIMEOUT_MS = "0";
+    const nativeFetch = globalThis.fetch;
+    let callbackUrl: string | undefined;
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (url.startsWith("http://127.0.0.1:")) return nativeFetch(input, init);
+      if (url.endsWith("/.well-known/litellm-cli-auth"))
+        return jsonResponse(200, {
+          contract_version: 1,
+          issuer: "https://litellm.example.com",
+          authorization_endpoint: "https://litellm.example.com/authorize",
+          token_endpoint: "https://litellm.example.com/token",
+          registration_endpoint: "https://litellm.example.com/register",
+          resource: "https://litellm.example.com",
+          code_challenge_methods_supported: ["S256"],
+        });
+      if (url.endsWith("/register")) {
+        callbackUrl = JSON.parse(String(init?.body)).redirect_uris[0];
+        if (outcome === "registration failure") return jsonResponse(500, {});
+        return jsonResponse(200, { client_id: "llm_dcrc_client", redirect_uris: [callbackUrl] });
+      }
+      if (url.endsWith("/token")) {
+        if (outcome === "token failure") return jsonResponse(500, {});
+        return jsonResponse(200, {
+          access_token: "access-new",
+          refresh_token: "refresh-new",
+          token_type: "Bearer",
+          expires_in: 3600,
+        });
+      }
+      throw new Error(`unexpected URL: ${url}`);
+    });
+    const extension = await loadExtension(agentDir);
+    const pi = createPi();
+    await extension(pi);
+    const login = loginOAuth(pi.providers[0]!, {
+      onPrompt: async (prompt) => (prompt.placeholder ? "https://litellm.example.com" : ""),
+      onAuth: ({ url }) => {
+        const authorizationUrl = new URL(url);
+        const response =
+          outcome === "OAuth denial"
+            ? "error=access_denied&error_description=User%20declined"
+            : "code=authorization-code";
+        void fetch(
+          `${authorizationUrl.searchParams.get("redirect_uri")}?state=${authorizationUrl.searchParams.get("state")}&${response}`,
+        );
+      },
+      pkce: true,
+      signal: new AbortController().signal,
+    });
+    if (expectedError) await expect(login).rejects.toThrow(expectedError);
+    else await expect(login).resolves.toMatchObject({ access: "access-new" });
+    await expect(nativeFetch(`${callbackUrl}?code=authorization-code`)).rejects.toThrow();
+  });
+
   it("completes CLI SSO with the server lifetime and selected team", async () => {
     const agentDir = await makeAgentDir();
     process.env.LITELLM_DISCOVERY_TIMEOUT_MS = "0";
@@ -1733,6 +2345,7 @@ describe("extension startup", () => {
     const timeoutController = new AbortController();
     const nativeTimeout = AbortSignal.timeout.bind(AbortSignal);
     vi.spyOn(AbortSignal, "timeout")
+      .mockImplementationOnce(nativeTimeout)
       .mockImplementationOnce(nativeTimeout)
       .mockImplementationOnce(() => timeoutController.signal)
       .mockImplementation(nativeTimeout);
