@@ -670,6 +670,7 @@ async function requestPkceToken(
   form: URLSearchParams,
   signal: AbortSignal,
   headers?: Record<string, string>,
+  existingRefreshToken?: string,
 ): Promise<PkceTokenResult> {
   let response: Response;
   try {
@@ -708,7 +709,7 @@ async function requestPkceToken(
   const expires = typeof data?.expires_in === "number" ? Date.now() + data.expires_in * 1_000 : NaN;
   if (
     !isAuthToken(data?.access_token) ||
-    !isAuthToken(data.refresh_token) ||
+    (!isAuthToken(data.refresh_token) && !isAuthToken(existingRefreshToken)) ||
     typeof data.token_type !== "string" ||
     data.token_type.toLowerCase() !== "bearer" ||
     typeof data.expires_in !== "number" ||
@@ -722,7 +723,8 @@ async function requestPkceToken(
     ok: true,
     token: {
       access: data.access_token,
-      refresh: data.refresh_token,
+      // A refresh may not rotate the refresh token; keep the existing one when the server omits it.
+      refresh: isAuthToken(data.refresh_token) ? data.refresh_token : existingRefreshToken!,
       expires,
       userId: typeof data.user_id === "string" && data.user_id ? data.user_id : undefined,
       teamId: typeof data.team_id === "string" && data.team_id ? data.team_id : undefined,
@@ -1088,6 +1090,7 @@ async function refreshLiteLLM(
       }),
       signal ?? AbortSignal.timeout(LOGIN_TIMEOUT_MS),
       resolveHeaders(definition),
+      credentials.refresh,
     );
     if (!result.ok) {
       if (result.transient && Date.now() < credentials.expires) return credentials;

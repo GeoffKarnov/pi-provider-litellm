@@ -1449,6 +1449,30 @@ describe("extension startup", () => {
       expect(new Headers(init?.headers).get("x-tenant")).toBe("tenant-a");
     });
 
+    it("keeps the existing refresh token when the server does not rotate it", async () => {
+      const now = 1_800_000_000_000;
+      process.env.LITELLM_DISCOVERY_TIMEOUT_MS = "0";
+      const extension = await loadExtension(await makeAgentDir());
+      const pi = createPi();
+      await extension(pi);
+      vi.spyOn(Date, "now").mockReturnValue(now);
+      vi.spyOn(globalThis, "fetch").mockResolvedValue(
+        jsonResponse(200, {
+          access_token: "access-new",
+          token_type: "bearer",
+          expires_in: 3600,
+        }),
+      );
+      const credential = pkceCredential();
+
+      await expect(pi.providers[0]?.auth.oauth?.refresh(credential, TEST_SIGNAL)).resolves.toEqual({
+        ...credential,
+        access: "access-new",
+        refresh: "refresh-old",
+        expires: now + 3_600_000,
+      });
+    });
+
     it.each([429, 500, 503, "network", "body"])("keeps fresh PKCE credentials after %s", async (failure) => {
       const now = 1_800_000_000_000;
       process.env.LITELLM_DISCOVERY_TIMEOUT_MS = "0";
