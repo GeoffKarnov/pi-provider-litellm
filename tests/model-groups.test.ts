@@ -2326,7 +2326,7 @@ describe("native Messages route selection", () => {
       ],
       () => ({
         ...claude({ forceAdaptiveThinking: true }),
-        thinkingLevelMap: { max: "max" },
+        messagesThinkingLevelMap: { max: "max" },
       }),
     );
 
@@ -2345,7 +2345,7 @@ describe("native Messages route selection", () => {
       ],
       () => ({
         ...claude({ forceAdaptiveThinking: true }),
-        thinkingLevelMap: { xhigh: "xhigh", max: "max" },
+        messagesThinkingLevelMap: { xhigh: "xhigh", max: "max" },
       }),
     );
 

@@ -845,25 +845,16 @@ export function reduceModelGroup(
   ]);
   let thinkingLevelMap = reasoning && acceptsResponsesReasoningControl ? evidenceLevelMap : undefined;
   if (api === "anthropic-messages") {
-    const nativeCatalogs = hasCatalogAuthority ? catalogAuthority : catalogAuthorityAmbiguous ? [] : catalogs;
-    const nativeMap = unanimous(
-      nativeCatalogs.map((catalog) => stableJson(catalog?.messagesThinkingLevelMap ?? catalog?.thinkingLevelMap)),
-    );
-    thinkingLevelMap = nativeMap ? JSON.parse(nativeMap) : undefined;
-    if (thinkingLevelMap) {
-      // OpenAI effort flags can restrict a native catalog level, never add a
-      // level or replace an Anthropic effort with an OpenAI spelling.
-      for (const [level, flag] of Object.entries(LITELLM_LEVEL_FLAGS) as Array<
-        [keyof typeof LITELLM_LEVEL_FLAGS, (typeof LITELLM_LEVEL_FLAGS)[keyof typeof LITELLM_LEVEL_FLAGS]]
-      >) {
-        const reported = deployments.map((entry) => entry.model_info?.[flag]);
-        if (
-          thinkingLevelMap[level] !== undefined &&
-          reported.some((value) => value !== undefined) &&
-          !reported.every((value) => wireBoolean(value) === true)
-        ) {
-          thinkingLevelMap[level] = null;
-        }
+    thinkingLevelMap = intersectThinkingLevelMaps(catalogs.map((catalog) => catalog?.messagesThinkingLevelMap));
+    // Native serializer restrictions apply even when catalog pricing is withheld.
+    // Router flags can also deny Pi's implicit default levels, never add a level.
+    for (const [level, flag] of Object.entries(LITELLM_LEVEL_FLAGS) as Array<
+      [keyof typeof LITELLM_LEVEL_FLAGS, (typeof LITELLM_LEVEL_FLAGS)[keyof typeof LITELLM_LEVEL_FLAGS]]
+    >) {
+      const reported = deployments.map((entry) => entry.model_info?.[flag]);
+      if (reported.some((value) => value !== undefined) && !reported.every((value) => wireBoolean(value) === true)) {
+        thinkingLevelMap ??= {};
+        thinkingLevelMap[level] = null;
       }
     }
   }

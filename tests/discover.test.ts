@@ -5750,6 +5750,53 @@ describe("discoverModels timeout", () => {
 });
 
 describe("native Messages discovery", () => {
+  it.each(["claude-sonnet-4-6", "claude-opus-4-5"])(
+    "honors denied default native reasoning levels for %s",
+    async (backend) => {
+      mockEndpoints({
+        "/model/info": () =>
+          jsonResponse(200, {
+            data: [
+              {
+                model_name: "native-levels",
+                litellm_params: { model: `anthropic/${backend}` },
+                model_info: {
+                  mode: "chat",
+                  litellm_provider: "anthropic",
+                  supports_none_reasoning_effort: false,
+                  supports_low_reasoning_effort: false,
+                },
+              },
+            ],
+          }),
+      });
+      const result = await discoverModels("https://litellm.example.com", "sk-test", { modelsDev: false });
+      const model = { ...result.models[0]!, provider: "litellm", baseUrl: "https://proxy.example.com" };
+      expect(model.api).toBe("anthropic-messages");
+      expect(getSupportedThinkingLevels(model)).not.toContain("off");
+      expect(getSupportedThinkingLevels(model)).not.toContain("low");
+      expect(getSupportedThinkingLevels(model)).toContain("medium");
+    },
+  );
+
+  it("retains native reasoning denials across different Claude generations", async () => {
+    mockEndpoints({
+      "/model/info": () =>
+        jsonResponse(200, {
+          data: ["claude-sonnet-4-6", "claude-fable-5"].map((backend) => ({
+            model_name: "mixed-native-levels",
+            litellm_params: { model: `anthropic/${backend}` },
+            model_info: { id: backend, mode: "chat", litellm_provider: "anthropic", supports_reasoning: true },
+          })),
+        }),
+    });
+    const result = await discoverModels("https://litellm.example.com", "sk-test", { modelsDev: false });
+    const model = { ...result.models[0]!, provider: "litellm", baseUrl: "https://proxy.example.com" };
+    expect(model.api).toBe("anthropic-messages");
+    expect(getSupportedThinkingLevels(model)).not.toContain("off");
+    expect(getSupportedThinkingLevels(model)).toContain("high");
+  });
+
   it("uses Anthropic catalog metadata and Messages for the standard Vertex Claude adapter", async () => {
     mockEndpoints({
       "/model/info": () =>
