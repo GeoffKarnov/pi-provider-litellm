@@ -851,8 +851,13 @@ export function reduceModelGroup(
     for (const [level, flag] of Object.entries(LITELLM_LEVEL_FLAGS) as Array<
       [keyof typeof LITELLM_LEVEL_FLAGS, (typeof LITELLM_LEVEL_FLAGS)[keyof typeof LITELLM_LEVEL_FLAGS]]
     >) {
-      const reported = deployments.map((entry) => entry.model_info?.[flag]);
-      if (reported.some((value) => value !== undefined) && !reported.every((value) => wireBoolean(value) === true)) {
+      const reported = deployments.map((entry) => wireBoolean(entry.model_info?.[flag]));
+      if (
+        reported.some((value) => value === false) ||
+        ((level === "xhigh" || level === "max") &&
+          reported.some((value) => value !== undefined) &&
+          !reported.every((value) => value === true))
+      ) {
         thinkingLevelMap ??= {};
         thinkingLevelMap[level] = null;
       }

@@ -5750,6 +5750,38 @@ describe("discoverModels timeout", () => {
 });
 
 describe("native Messages discovery", () => {
+  it.each([
+    { flags: [null], low: true, max: true },
+    { flags: [true, undefined], low: true, max: false },
+    { flags: [true, null], low: true, max: false },
+    { flags: [null, undefined], low: true, max: true },
+    { flags: [false, undefined], low: false, max: false },
+    { flags: [true, true], low: true, max: true },
+  ])("treats native reasoning flags $flags as boolean evidence", async ({ flags, low, max }) => {
+    mockEndpoints({
+      "/model/info": () =>
+        jsonResponse(200, {
+          data: flags.map((flag, index) => ({
+            model_name: "native-flag-evidence",
+            litellm_params: { model: "anthropic/claude-sonnet-4-6" },
+            model_info: {
+              id: String(index),
+              mode: "chat",
+              litellm_provider: "anthropic",
+              supports_low_reasoning_effort: flag,
+              supports_max_reasoning_effort: flag,
+            },
+          })),
+        }),
+    });
+    const result = await discoverModels("https://litellm.example.com", "sk-test", { modelsDev: false });
+    const model = { ...result.models[0]!, provider: "litellm", baseUrl: "https://proxy.example.com" };
+    expect(model.api).toBe("anthropic-messages");
+    const levels = getSupportedThinkingLevels(model);
+    expect(levels.includes("low")).toBe(low);
+    expect(levels.includes("max")).toBe(max);
+  });
+
   it.each(["claude-sonnet-4-6", "claude-opus-4-5"])(
     "honors denied default native reasoning levels for %s",
     async (backend) => {
