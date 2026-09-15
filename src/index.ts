@@ -1225,11 +1225,14 @@ function createProviderAuth(
             }
           : undefined,
       check: async ({ ctx, credential }) => {
+        const stored = readStoredCredential(definition.name, join(getAgentDir(), "auth.json"));
         const liveUrl = credential?.env?.[ENV_BASE_URL];
         const envUrl = definition.useDefaultEnv ? await ctx.env(ENV_BASE_URL) : undefined;
-        const baseUrl = liveUrl ?? definition.baseUrl ?? envUrl;
+        const storedUrl = stored?.env?.[ENV_BASE_URL];
+        const baseUrl = liveUrl ?? definition.baseUrl ?? envUrl ?? storedUrl;
         if (!cleanConfig(baseUrl)) return undefined;
         if (credential?.key) return { type: "api_key", source: "stored credential" };
+        if (stored?.key) return { type: "api_key", source: "auth.json" };
 
         // Credentials `resolve` would fall back to if ADC cannot mint a token.
         const fallbackSource = async (): Promise<string | undefined> => {
