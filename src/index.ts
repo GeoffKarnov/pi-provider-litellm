@@ -1,5 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
+import { existsSync, linkSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { join } from "node:path";
@@ -22,6 +23,7 @@ import { getGcloudToken, hasGcloudAdcCredentials, isGcloudTokenAuthEnabled } fro
 import {
   createMcpToolDefinitions,
   credentialFingerprint,
+  McpAccessDeniedError,
   reportMcpCatalogOutcome,
   reportMcpPartialDiscovery,
   reportMcpRegistrationFatal,
@@ -65,6 +67,8 @@ type RawProviderSettings = {
   enabled?: unknown;
   allowInsecureHttp?: unknown;
 };
+
+type McpRuntimeAuth = LiteLLMRuntimeAuth & { mcpPauseSource?: string };
 
 type ProviderDefinition = {
   name: string;
@@ -1201,11 +1205,25 @@ async function resolveApiKeyAuth(
   };
 }
 
-function createProviderAuth(definition: ProviderDefinition, clearOAuthRuntimeRoot?: () => void): ProviderAuth {
+function createProviderAuth(
+  definition: ProviderDefinition,
+  clearOAuthRuntimeRoot?: () => void,
+  onLogin?: () => void,
+): ProviderAuth {
+  function completeLogin<T extends Credential>(credential: T): T {
+    onLogin?.();
+    return onLogin ? { ...credential, litellmMcpSession: randomBytes(16).toString("hex") } : credential;
+  }
   return {
     apiKey: {
       name: `${definition.displayName} API key`,
-      login: definition.name === PROVIDER_NAME ? (interaction) => loginApiKey(interaction, definition) : undefined,
+      login:
+        definition.name === PROVIDER_NAME
+          ? async (interaction) => {
+              const credential = await loginApiKey(interaction, definition);
+              return completeLogin(credential);
+            }
+          : undefined,
       check: async ({ ctx, credential }) => {
         const baseUrl =
           credential?.env?.[ENV_BASE_URL] ??
@@ -1245,7 +1263,10 @@ function createProviderAuth(definition: ProviderDefinition, clearOAuthRuntimeRoo
       ? {
           name: "LiteLLM SSO",
           loginLabel: "Sign in with LiteLLM SSO",
-          login: (interaction) => loginOAuth(interaction, definition),
+          login: async (interaction) => {
+            const credential = await loginOAuth(interaction, definition);
+            return completeLogin(credential);
+          },
           refresh: async (credential, signal) => ({
             ...(await refreshLiteLLM(credential, definition, signal)),
             type: "oauth" as const,
@@ -1493,6 +1514,29 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   const mcpEnabled = isFeatureEnabled(settings, "mcp");
   const providerNames = new Set(definitions.map((definition) => definition.name));
   const oauthRuntimeRoots = new Map<string, { apiKey: string; root: string }>();
+  let mcpUI: ExtensionContext["ui"] | undefined;
+  let sessionStarted = false;
+  const pendingMcpMessages = new Map<string, "info" | "warning">();
+
+  function notifyMcp(message: string, level: "info" | "warning" = "warning"): void {
+    const text = message.trimEnd();
+    if (mcpUI) mcpUI.notify(text, level);
+    // Pi starts the terminal before supplying an ExtensionContext. Buffer until session_start.
+    else if (!sessionStarted && process.stderr.isTTY) pendingMcpMessages.set(text, level);
+    else process.stderr.write(`${text}\n`);
+  }
+
+  pi.on("session_start", (_event, ctx) => {
+    sessionStarted = true;
+    mcpUI = ctx.hasUI ? ctx.ui : undefined;
+    for (const [message, level] of pendingMcpMessages) notifyMcp(message, level);
+    pendingMcpMessages.clear();
+  });
+  pi.on("session_shutdown", () => {
+    mcpUI = undefined;
+    sessionStarted = false;
+    pendingMcpMessages.clear();
+  });
 
   function discoveryDisabledReason(): string | null {
     if (isOffline()) return `${ENV_OFFLINE}=1`;
@@ -1532,6 +1576,14 @@ export default async function (pi: ExtensionAPI): Promise<void> {
       apiKey: resolved.auth.apiKey,
       headers: resolved.auth.headers,
       allowInsecureHttp: definition.allowInsecureHttp,
+      mcpPauseSource:
+        resolved.source === GCLOUD_ADC_SOURCE
+          ? GCLOUD_ADC_SOURCE
+          : resolved.source === ENV_API_KEY_HELPER
+            ? normalizeCommand(process.env[ENV_API_KEY_HELPER])
+            : resolved.source?.startsWith("!")
+              ? resolved.source
+              : undefined,
     };
   }
 
@@ -1543,15 +1595,98 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   // instance with its own state, which starts clean on its own.
   let mcpRegistrationFatal = false;
   let defaultRuntimeAuth: LiteLLMRuntimeAuth | undefined;
+  const mcpPauseDir = join(getAgentDir(), "litellm-mcp-pauses");
+  const mcpPauseInMemory = new Set<string>();
+  let mcpPauseSalt: Buffer | undefined;
+  let mcpPausePersistent = true;
+  let mcpLoginGeneration = 0;
+
+  function getMcpPauseSalt(): Buffer {
+    if (!mcpPauseSalt) {
+      try {
+        mkdirSync(mcpPauseDir, { recursive: true, mode: 0o700 });
+        const saltPath = join(mcpPauseDir, "identity-key");
+        if (!existsSync(saltPath)) {
+          const temporary = join(mcpPauseDir, `.identity-key-${randomBytes(16).toString("hex")}`);
+          try {
+            writeFileSync(temporary, randomBytes(32), { mode: 0o600, flag: "wx" });
+            try {
+              // Publish a complete key without replacing one created by another Pi process.
+              linkSync(temporary, saltPath);
+            } catch (error) {
+              if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+            }
+          } finally {
+            rmSync(temporary, { force: true });
+          }
+        }
+        const salt = readFileSync(saltPath);
+        if (salt.length !== 32) throw new Error("Invalid MCP pause identity key");
+        mcpPauseSalt = salt;
+      } catch {
+        mcpPauseSalt = randomBytes(32);
+        mcpPausePersistent = false;
+        notifyMcp("LiteLLM MCP: could not read or initialize persisted discovery pause state.");
+      }
+    }
+    return mcpPauseSalt;
+  }
+
+  function mcpSession(credential: Credential | OAuthCredentials | undefined): string | undefined {
+    const session = (credential as { litellmMcpSession?: unknown } | undefined)?.litellmMcpSession;
+    return typeof session === "string" ? session : undefined;
+  }
+
+  function mcpPausePath(auth: McpRuntimeAuth, credential: Credential): string {
+    const salt = getMcpPauseSalt();
+    const source =
+      auth.mcpPauseSource ??
+      (credential.type === "api_key" && credential.key?.startsWith("!") ? credential.key : undefined);
+    const key = source ?? auth.apiKey;
+    const session = mcpSession(credential) ?? credentialFingerprint(key, undefined, salt);
+    const identity = credentialFingerprint(
+      JSON.stringify([
+        normalizeBaseUrl(auth.baseUrl, auth.allowInsecureHttp),
+        session,
+        credential.type === "oauth" ? null : [source ? "source" : "key", key],
+      ]),
+      auth.headers,
+      salt,
+    );
+    return join(mcpPauseDir, `paused-${identity}`);
+  }
+
+  function pauseMcpDiscovery(auth: McpRuntimeAuth, credential: Credential): void {
+    const path = mcpPausePath(auth, credential);
+    mcpPauseInMemory.add(path);
+    try {
+      if (!mcpPausePersistent) throw new Error("MCP pause persistence unavailable");
+      writeFileSync(path, "", { mode: 0o600 });
+    } catch {
+      notifyMcp("LiteLLM MCP: could not persist the discovery pause across restarts.");
+    }
+  }
+
+  function resumeMcpDiscovery(): void {
+    mcpLoginGeneration += 1;
+    registeredMcpIdentity = undefined;
+    // The new login ID selects a fresh scope; other processes may still use the old scopes.
+  }
+
+  function isMcpPaused(auth: McpRuntimeAuth, credential: Credential): boolean {
+    if (!mcpPauseInMemory.size && !existsSync(mcpPauseDir)) return false;
+    const path = mcpPausePath(auth, credential);
+    return mcpPauseInMemory.has(path) || (mcpPausePersistent && existsSync(path));
+  }
 
   // Identifies the catalog a set of credentials points at, so a credential change forces
   // re-registration. The base URL stays readable because it is not secret and is useful when
   // reasoning about a refresh; everything credential-bearing is reduced to a non-reversible
   // fingerprint so no key or header value is held in the identity string.
-  function mcpCatalogIdentity(auth: LiteLLMRuntimeAuth): string {
+  function mcpCatalogIdentity(auth: LiteLLMRuntimeAuth, credential: Credential): string {
     return JSON.stringify({
       baseUrl: normalizeBaseUrl(auth.baseUrl, auth.allowInsecureHttp),
-      credential: credentialFingerprint(auth.apiKey, auth.headers),
+      credential: credentialFingerprint(JSON.stringify([auth.apiKey, mcpSession(credential)]), auth.headers),
     });
   }
 
@@ -1607,13 +1742,20 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     });
   }
 
-  async function registerMcpTools(auth: LiteLLMRuntimeAuth, signal?: AbortSignal): Promise<void> {
-    if (!mcpEnabled || discoveryDisabledReason() || mcpRegistrationFatal) return;
-    const identity = mcpCatalogIdentity(auth);
+  async function registerMcpTools(auth: McpRuntimeAuth, credential: Credential, signal?: AbortSignal): Promise<void> {
+    if (!mcpEnabled || discoveryDisabledReason() || mcpRegistrationFatal || isMcpPaused(auth, credential)) return;
+    const loginGeneration = mcpLoginGeneration;
+    const identity = mcpCatalogIdentity(auth, credential);
     while (mcpRegistration) {
       await waitForMcpRegistration(mcpRegistration, signal);
       signal?.throwIfAborted();
-      if (mcpRegistrationFatal || registeredMcpIdentity === identity) return;
+      if (
+        mcpRegistrationFatal ||
+        isMcpPaused(auth, credential) ||
+        loginGeneration !== mcpLoginGeneration ||
+        registeredMcpIdentity === identity
+      )
+        return;
     }
     if (registeredMcpIdentity === identity) return;
 
@@ -1622,10 +1764,12 @@ export default async function (pi: ExtensionAPI): Promise<void> {
         signal?.throwIfAborted();
         const { definitions, report } = await createMcpToolDefinitions(
           (ctx) => (ctx?.modelRegistry ? resolveDefaultRuntimeAuth(ctx) : Promise.resolve(auth)),
-          isVerboseDiscovery() ? (message) => process.stderr.write(`LiteLLM MCP: ${message}\n`) : undefined,
+          isVerboseDiscovery() ? (message) => notifyMcp(`LiteLLM MCP: ${message}`, "info") : undefined,
           signal,
+          notifyMcp,
         );
         signal?.throwIfAborted();
+        if (loginGeneration !== mcpLoginGeneration) return;
         const registeredNames: string[] = [];
         try {
           for (const definition of definitions) {
@@ -1640,26 +1784,33 @@ export default async function (pi: ExtensionAPI): Promise<void> {
           // Fatal for this instance: report once, with a bounded Pi-authored cause and no proxy text,
           // then stop retrying so a stale instance cannot churn discovery on every later refresh.
           mcpRegistrationFatal = true;
-          reportMcpRegistrationFatal(registeredNames.length, definitions.length, error);
+          reportMcpRegistrationFatal(registeredNames.length, definitions.length, error, notifyMcp);
           return;
         }
         reportMcpRegistrationSuccess();
-        reportMcpPartialDiscovery(report.partialFailure, registeredNames);
+        reportMcpPartialDiscovery(report.partialFailure, registeredNames, notifyMcp);
         if (isVerboseDiscovery()) {
-          process.stderr.write(
+          notifyMcp(
             `LiteLLM MCP: registered ${registeredNames.length} of ${definitions.length} prepared MCP tools ` +
-              `(${report.discovered} raw, ${report.enveloped} enveloped).\n`,
+              `(${report.discovered} raw, ${report.enveloped} enveloped).`,
+            "info",
           );
         }
         // A catalog that produced nothing or came from a partial-failure response is not settled:
         // leaving the identity unset lets a later refresh retry discovery, which is network-only and
         // non-blocking. Re-registering surviving tools is safe because Pi replaces tools by name.
-        reportMcpCatalogOutcome(report.discovered, definitions.length);
+        reportMcpCatalogOutcome(report.discovered, definitions.length, notifyMcp);
         if (definitions.length > 0 && !report.partialFailure) registeredMcpIdentity = identity;
       } catch (error) {
         if (signal?.aborted) throw signal.reason;
-        process.stderr.write(
-          `LiteLLM (${PROVIDER_NAME}): MCP tool discovery failed (${error instanceof Error ? error.message : String(error)}).\n`,
+        if (loginGeneration !== mcpLoginGeneration) return;
+        if (error instanceof McpAccessDeniedError) {
+          pauseMcpDiscovery(auth, credential);
+          notifyMcp("LiteLLM MCP: access denied; discovery paused until /login litellm succeeds.");
+          return;
+        }
+        notifyMcp(
+          `LiteLLM (${PROVIDER_NAME}): MCP tool discovery failed (${error instanceof Error ? error.message : String(error)}).`,
         );
       }
     })();
@@ -1712,8 +1863,28 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   const seeded = await Promise.all(definitions.map(seedModels));
 
   for (const [index, definition] of definitions.entries()) {
-    const auth = createProviderAuth(definition, () => oauthRuntimeRoots.delete(definition.name));
+    const auth = createProviderAuth(
+      definition,
+      () => oauthRuntimeRoots.delete(definition.name),
+      definition.name === PROVIDER_NAME ? resumeMcpDiscovery : undefined,
+    );
     if (auth.oauth) {
+      if (definition.name === PROVIDER_NAME) {
+        const refresh = auth.oauth.refresh;
+        auth.oauth.refresh = async (credential, signal) => {
+          // Resolve legacy credentials' stable scope before an in-flight denial or token rotation.
+          const session =
+            mcpSession(credential) ??
+            (mcpEnabled ? credentialFingerprint(credential.access, undefined, getMcpPauseSalt()) : undefined);
+          const refreshed = await refresh(credential, signal);
+          return session &&
+            (mcpSession(credential) ||
+              refreshed.access !== credential.access ||
+              refreshed.refresh !== credential.refresh)
+            ? { ...refreshed, litellmMcpSession: session }
+            : refreshed;
+        };
+      }
       const toAuth = auth.oauth.toAuth;
       auth.oauth.toAuth = async (credential) => {
         const resolved = await toAuth(credential);
@@ -1748,6 +1919,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     Object.assign(provider, { headers: resolveHeaders(definition) });
     const refreshModels = provider.refreshModels!;
     provider.refreshModels = async (context) => {
+      const loginGeneration = mcpLoginGeneration;
       try {
         await refreshModels(context);
       } finally {
@@ -1755,14 +1927,17 @@ export default async function (pi: ExtensionAPI): Promise<void> {
           definition.name === PROVIDER_NAME &&
           context.allowNetwork &&
           !discoveryDisabledReason() &&
+          loginGeneration === mcpLoginGeneration &&
           context.credential
         ) {
           // Best-effort: refreshing the cached default auth / MCP catalog must not let a bad or
           // placeholder credential override refreshModels' own try/throw outcome via `finally`.
           try {
             const auth = await authForCredential(definition, context.credential);
-            defaultRuntimeAuth = auth;
-            void registerMcpTools(auth, context.signal).catch(() => undefined);
+            if (loginGeneration === mcpLoginGeneration) {
+              defaultRuntimeAuth = auth;
+              void registerMcpTools(auth, context.credential, context.signal).catch(() => undefined);
+            }
           } catch {
             // ignored — authForCredential already reported/will report this via the paths that use it directly.
           }

@@ -230,6 +230,28 @@ describe("discoverMcpTools", () => {
   });
 
   it.each([
+    [401, { detail: "private authentication details" }],
+    [403, { detail: "private authorization details" }],
+    [200, { tools: [], error: "access_denied", message: "private details" }],
+    [
+      200,
+      {
+        tools: [],
+        error: "unexpected_error",
+        message:
+          "An unexpected error occurred: {'error': 'access_denied', 'message': 'The key is not allowed to access any MCP servers.'}",
+      },
+    ],
+  ])("classifies MCP access denial without exposing the response (%s)", async (status, body) => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse(status, body));
+
+    await expect(discoverMcpTools("https://litellm.example.com", "sk-test")).rejects.toMatchObject({
+      name: "McpAccessDeniedError",
+      message: "MCP access denied",
+    });
+  });
+
+  it.each([
     ["unexpected_error", "MCP discovery reported an unexpected proxy error"],
     ["proxy-owned-tag", "MCP discovery reported an error"],
   ])("uses fixed text for the %s discovery failure tag", async (proxyTag, expectedMessage) => {
