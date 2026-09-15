@@ -171,7 +171,7 @@ export async function runSsoLoginSmoke(
     const fetchImpl = globalThis.fetch;
     // The smoke proxy has no SSO IdP, so protocol tests cover CLI SSO while this keeps legacy fallback live.
     globalThis.fetch = (input, init) =>
-      String(input) === `${baseUrl}/sso/cli/start`
+      String(input) === `${baseUrl}/.well-known/litellm-cli-auth` || String(input) === `${baseUrl}/sso/cli/start`
         ? Promise.resolve(new Response(null, { status: 404 }))
         : fetchImpl(input, init);
     let credential: Awaited<ReturnType<typeof oauth.login>>;

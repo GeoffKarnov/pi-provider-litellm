@@ -50,17 +50,21 @@ If a proxy URL is already known — from `providers.<name>.baseUrl`, `LITELLM_BA
 
 #### Enterprise SSO login
 
-If your LiteLLM proxy requires SSO/OAuth authentication (enterprise deployments), you can authenticate through LiteLLM's CLI SSO flow:
+If your LiteLLM proxy supports SSO/OAuth authentication, Pi selects its supported browser login flow automatically:
 
 1. Run `/login litellm` inside pi and select `Sign in with LiteLLM SSO`
 2. Confirm the offered proxy URL, or enter one if this is the first login
-3. Pi displays a verification code and opens the LiteLLM SSO login URL automatically
-4. Authenticate in the browser and confirm the displayed code
-5. If your account belongs to multiple teams, select the team for this session in Pi
+3. Complete sign-in in the browser Pi opens, then return to Pi
 
-Pi polls the proxy until authentication completes and stores the returned short-lived CLI token. Newer proxies advertise the token lifetime; for older proxies, Pi uses `LITELLM_CLI_JWT_EXPIRATION_HOURS` or LiteLLM's 24-hour default. On LiteLLM versions that gate CLI SSO, start the proxy with `EXPERIMENTAL_UI_LOGIN=True`.
+Pi first checks `/.well-known/litellm-cli-auth`. A proxy exposing the supported CLI-auth contract uses authorization code + PKCE (`S256`) with a temporary `127.0.0.1` callback; the browser must run on the same machine as Pi. Advertised endpoints must stay on the proxy's origin, and discovery, registration, and token requests do not follow HTTP redirects. Invalid discovery stops login.
 
-Older proxies without `/sso/cli/start` fall back to the legacy browser flow: copy the token from the LiteLLM UI, paste it into Pi, and optionally exchange it for a virtual key. Pi reads JWT expiry claims and prompts you to run `/login litellm` again when re-authentication is required.
+Pi stores PKCE access and refresh tokens in `~/.pi/agent/auth.json` with file mode `0600`, refreshes automatically, and saves each rotated token pair. Temporary network failures or HTTP 429/5xx responses allow reuse of the existing access token only until its exact expiry. Rejected or revoked refresh credentials require `/login litellm` again.
+
+If discovery returns 404, Pi uses `/sso/cli/start`: confirm the verification code in the browser, then select a team in Pi if prompted. Pi polls for the short-lived CLI token and uses its advertised lifetime, falling back to `LITELLM_CLI_JWT_EXPIRATION_HOURS` or LiteLLM's 24-hour default on older proxies. Only LiteLLM versions that gate this older CLI SSO flow need `EXPERIMENTAL_UI_LOGIN=True` on the proxy.
+
+If `/sso/cli/start` returns 404 or 405, copy the token from the LiteLLM UI and paste it into Pi, with an optional virtual-key exchange. Pi reads JWT expiry claims and prompts for login when re-authentication is required.
+
+Tokens are stored in Pi's local file, not an OS keychain. `/logout litellm` deletes the local credential only; logging out or signing in again does not revoke the previous session on the proxy because Pi has no provider revocation hook.
 
 ### Option B — environment variables
 
