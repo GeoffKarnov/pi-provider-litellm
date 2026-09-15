@@ -1057,9 +1057,10 @@ async function loginOAuth(interaction: AuthInteraction, definition: ProviderDefi
   };
 }
 
-// Keyed by provider name: how long to skip re-attempting a refresh after a transient
-// failure, so callers serialized behind Pi's credential lock don't each fire another
-// request at the still-failing token endpoint (e.g. during an outage or rate limit).
+// Keyed by refresh token (so one credential's failures never delay another's refresh):
+// how long to skip re-attempting a refresh after a transient failure, so callers
+// serialized behind Pi's credential lock don't each fire another request at the
+// still-failing token endpoint (e.g. during an outage or rate limit).
 const pkceTransientRefreshBackoff = new Map<string, number>();
 
 async function refreshLiteLLM(
@@ -1079,7 +1080,7 @@ async function refreshLiteLLM(
       throw new Error("Invalid LiteLLM PKCE credential; run /login litellm again");
     }
     if (Date.now() < credentials.expires) {
-      const backoffUntil = pkceTransientRefreshBackoff.get(definition.name);
+      const backoffUntil = pkceTransientRefreshBackoff.get(credentials.refresh);
       if (backoffUntil !== undefined && Date.now() < backoffUntil) return credentials;
     }
     const baseUrl = requireCredentialRoot(
@@ -1102,14 +1103,12 @@ async function refreshLiteLLM(
       resolveHeaders(definition),
       credentials.refresh,
     );
-    if (!result.ok) {
-      if (result.transient && Date.now() < credentials.expires) {
-        pkceTransientRefreshBackoff.set(definition.name, Date.now() + PKCE_TRANSIENT_REFRESH_BACKOFF_MS);
-        return credentials;
-      }
-      throw new Error(`${result.message}; run /login litellm again`);
+    if (!result.ok && result.transient && Date.now() < credentials.expires) {
+      pkceTransientRefreshBackoff.set(credentials.refresh, Date.now() + PKCE_TRANSIENT_REFRESH_BACKOFF_MS);
+      return credentials;
     }
-    pkceTransientRefreshBackoff.delete(definition.name);
+    pkceTransientRefreshBackoff.delete(credentials.refresh);
+    if (!result.ok) throw new Error(`${result.message}; run /login litellm again`);
     return { ...credentials, ...result.token };
   }
   if (!credentials.refresh.startsWith("!")) {

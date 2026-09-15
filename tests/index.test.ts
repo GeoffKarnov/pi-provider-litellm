@@ -1515,6 +1515,34 @@ describe("extension startup", () => {
       await expect(pi.providers[0]?.auth.oauth?.refresh(credential, undefined as never)).resolves.toEqual(credential);
     });
 
+    it("scopes the transient PKCE refresh backoff to one credential", async () => {
+      process.env.LITELLM_DISCOVERY_TIMEOUT_MS = "0";
+      const extension = await loadExtension(await makeAgentDir());
+      const pi = createPi();
+      await extension(pi);
+      const fetchMock = vi
+        .spyOn(globalThis, "fetch")
+        .mockResolvedValueOnce(jsonResponse(503, {}))
+        .mockResolvedValueOnce(
+          jsonResponse(200, {
+            access_token: "access-new",
+            refresh_token: "refresh-new",
+            token_type: "Bearer",
+            expires_in: 3600,
+          }),
+        );
+      const refresh = pi.providers[0]!.auth.oauth!.refresh;
+      const failing = pkceCredential();
+      const other = { ...pkceCredential(), clientId: "llm_dcrc_other", refresh: "refresh-other" };
+
+      await expect(refresh(failing, TEST_SIGNAL)).resolves.toEqual(failing);
+      await expect(refresh(other, TEST_SIGNAL)).resolves.toMatchObject({
+        access: "access-new",
+        refresh: "refresh-new",
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
     it("rejects a transient PKCE refresh failure after expiry", async () => {
       const now = 1_800_000_000_000;
       process.env.LITELLM_DISCOVERY_TIMEOUT_MS = "0";
