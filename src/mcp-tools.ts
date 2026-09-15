@@ -52,6 +52,13 @@ interface InvalidMcpTool {
   identity: string;
 }
 
+export class McpAccessDeniedError extends Error {
+  constructor() {
+    super("MCP access denied");
+    this.name = "McpAccessDeniedError";
+  }
+}
+
 // Why a discovered MCP tool was not registered as the proxy described it.
 // `schema-envelope` is a degradation, not a loss: the tool still registers, with the
 // extension-owned envelope in place of a schema that could not be proven safe.
@@ -548,11 +555,21 @@ export async function discoverMcpTools(
     });
     if (!response.ok) {
       onProgress?.(`MCP tools discovery failed with status ${response.status}`);
+      if (response.status === 401 || response.status === 403) throw new McpAccessDeniedError();
       throw new Error(`HTTP ${response.status}`);
     }
     const body = parseDiscoveryJson(await readBoundedText(response, MAX_DISCOVERY_BODY_BYTES, "MCP discovery"));
     const bodyRecord = asRecord(body);
     const errorTag = bodyRecord?.error;
+    // Older proxies catch their own access denial and wrap it in an HTTP 200 unexpected_error.
+    // Recognize only the fixed denial sentence; never display the proxy's message.
+    if (
+      errorTag === "access_denied" ||
+      (errorTag === "unexpected_error" &&
+        typeof bodyRecord?.message === "string" &&
+        bodyRecord.message.includes("The key is not allowed to access any MCP servers."))
+    )
+      throw new McpAccessDeniedError();
     const partialFailure = errorTag === "partial_failure";
     // LiteLLM reports total MCP discovery failure in an HTTP 200 envelope. Use only
     // extension-owned text: neither its machine-readable tag nor its message is safe for stderr.
