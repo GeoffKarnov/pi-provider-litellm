@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { existsSync, linkSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, linkSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { join } from "node:path";
@@ -1670,15 +1670,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   function resumeMcpDiscovery(): void {
     mcpLoginGeneration += 1;
     registeredMcpIdentity = undefined;
-    try {
-      if (existsSync(mcpPauseDir)) {
-        for (const name of readdirSync(mcpPauseDir))
-          if (name.startsWith("paused-")) rmSync(join(mcpPauseDir, name), { force: true });
-      }
-      mcpPauseInMemory.clear();
-    } catch {
-      notifyMcp("LiteLLM MCP: could not clear the persisted discovery pause.");
-    }
+    // The new login ID selects a fresh scope; other processes may still use the old scopes.
   }
 
   function isMcpPaused(auth: McpRuntimeAuth, credential: Credential): boolean {

@@ -470,6 +470,12 @@ describe("extension startup", () => {
       await refresh(current);
       await vi.waitFor(() => expect(pi.tools.map((tool) => tool.name)).toContainEqual(named("mcp_server_search")));
       expect(listCalls).toBe(2);
+
+      // Other processes can still use the old login after this one signs in successfully.
+      pi = createPi();
+      await (await loadExtension(agentDir))(pi);
+      await refresh(rotated);
+      expect(listCalls).toBe(2);
     },
   );
 
@@ -584,6 +590,12 @@ describe("extension startup", () => {
     await vi.waitFor(() => expect(stderr.mock.calls.flat().join("")).toContain("discovery paused"));
     const restartedPi = persistent ? createPi() : pi;
     if (persistent) await (await loadExtension(agentDir))(restartedPi);
+    await refreshProvider(restartedPi.providers[0]!, { allowNetwork: true, credential: refreshed });
+    expect(listCalls).toBe(1);
+
+    await restartedPi.providers[0]!.auth.apiKey!.login!(
+      interaction(vi.fn().mockResolvedValueOnce("https://proxy.example.com").mockResolvedValueOnce("sk-new")),
+    );
     await refreshProvider(restartedPi.providers[0]!, { allowNetwork: true, credential: refreshed });
     expect(listCalls).toBe(1);
   });
