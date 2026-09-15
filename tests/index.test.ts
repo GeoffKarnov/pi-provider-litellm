@@ -1707,6 +1707,74 @@ describe("extension startup", () => {
     ).not.toThrow();
   });
 
+  it("keeps the OAuth base URL when Pi re-resolves auth with the session's own token", async () => {
+    delete process.env.LITELLM_BASE_URL;
+    delete process.env.LITELLM_API_KEY;
+    process.env.LITELLM_DISCOVERY_TIMEOUT_MS = "0";
+    const extension = await loadExtension(await makeAgentDir());
+    const pi = createPi();
+    await extension(pi);
+    const provider = pi.providers[0]!;
+
+    await provider.auth.oauth?.toAuth({
+      type: "oauth" as const,
+      access: "sk-sso",
+      refresh: "",
+      expires: Number.MAX_SAFE_INTEGER,
+      baseUrl: "https://oauth.example.com",
+    });
+
+    // Compaction hands the token it just resolved back as an apiKey override, which sends Pi
+    // down the api-key path with no base URL of its own.
+    await expect(resolveApiKey(provider, { type: "api_key", key: "sk-sso" })).resolves.toMatchObject({
+      auth: { apiKey: "sk-sso", baseUrl: "https://oauth.example.com" },
+    });
+
+    expect(() =>
+      provider.stream(
+        {
+          id: "sso-model",
+          name: "SSO model",
+          provider: "litellm",
+          api: "openai-completions",
+          baseUrl: "https://oauth.example.com/v1",
+          reasoning: false,
+          input: ["text"],
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+          contextWindow: 4096,
+          maxTokens: 1024,
+        },
+        { messages: [] },
+        { apiKey: "sk-sso" },
+      ),
+    ).not.toThrow();
+  });
+
+  it.each([
+    ["placeholder", "https://litellm.example.com", /placeholder LiteLLM base URL/],
+    ["insecure", "http://insecure.example.com", /http/i],
+  ])("still rejects a %s base URL when the session's own token is re-resolved", async (_label, baseUrl, expected) => {
+    delete process.env.LITELLM_API_KEY;
+    process.env.LITELLM_BASE_URL = baseUrl;
+    process.env.LITELLM_DISCOVERY_TIMEOUT_MS = "0";
+    const extension = await loadExtension(await makeAgentDir());
+    const pi = createPi();
+    await extension(pi);
+    const provider = pi.providers[0]!;
+
+    await provider.auth.oauth?.toAuth({
+      type: "oauth" as const,
+      access: "sk-sso",
+      refresh: "",
+      expires: Number.MAX_SAFE_INTEGER,
+      baseUrl: "https://oauth.example.com",
+    });
+
+    // A configured base URL must fail on its own terms — never fall back to the remembered
+    // OAuth root, which would silently reroute the request past the guard that rejected it.
+    await expect(resolveApiKey(provider, { type: "api_key", key: "sk-sso" })).rejects.toThrow(expected);
+  });
+
   it("leaves /login litellm to Pi's registered OAuth provider", async () => {
     const agentDir = await makeAgentDir();
     const extension = await loadExtension(agentDir);

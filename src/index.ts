@@ -1125,16 +1125,25 @@ async function refreshLiteLLM(
   return { ...credentials, access, expires: tokenExpiresAt(access, EXPIRE_TOKEN_IMMEDIATELY) };
 }
 
+async function configuredBaseUrl(
+  definition: ProviderDefinition,
+  ctx: { env(name: string): Promise<string | undefined> },
+  credential?: ApiKeyCredential,
+): Promise<string | undefined> {
+  return (
+    cleanConfig(credential?.env?.[ENV_BASE_URL]) ??
+    cleanConfig(definition.baseUrl) ??
+    (definition.useDefaultEnv ? cleanConfig(await ctx.env(ENV_BASE_URL)) : undefined)
+  );
+}
+
 async function resolveApiKeyAuth(
   definition: ProviderDefinition,
   ctx: { env(name: string): Promise<string | undefined> },
   credential?: ApiKeyCredential,
   executeHelpers = true,
 ) {
-  const baseUrl =
-    cleanConfig(credential?.env?.[ENV_BASE_URL]) ??
-    cleanConfig(definition.baseUrl) ??
-    (definition.useDefaultEnv ? cleanConfig(await ctx.env(ENV_BASE_URL)) : undefined);
+  const baseUrl = await configuredBaseUrl(definition, ctx, credential);
   const stored = credential?.key
     ? resolveConfigValue(credential.key, { executeCommands: executeHelpers })?.trim()
     : undefined;
@@ -1209,6 +1218,7 @@ function createProviderAuth(
   definition: ProviderDefinition,
   clearOAuthRuntimeRoot?: () => void,
   onLogin?: () => void,
+  oauthRuntimeRoot?: () => { apiKey: string; root: string } | undefined,
 ): ProviderAuth {
   function completeLogin<T extends Credential>(credential: T): T {
     onLogin?.();
@@ -1255,6 +1265,23 @@ function createProviderAuth(
         return fallback ? { type: "api_key", source: fallback } : undefined;
       },
       resolve: async ({ ctx, credential }) => {
+        // Pi re-resolves auth through this api-key path whenever a caller passes an explicit
+        // apiKey override — compaction and summarization both hand back the key they just
+        // resolved — which bypasses the stored OAuth credential carrying the base URL. An SSO
+        // session keeps its root nowhere else, so serve the one remembered for that exact
+        // access token. Only when nothing configures a root at all: a base URL that is set
+        // still resolves, and still fails, on its own terms rather than silently rerouting.
+        const remembered = oauthRuntimeRoot?.();
+        if (remembered && credential?.key === remembered.apiKey) {
+          const configured =
+            (await configuredBaseUrl(definition, ctx, credential)) ?? resolveCredentialRoot(definition, credential);
+          if (!configured) {
+            return {
+              auth: { apiKey: remembered.apiKey, headers: resolveHeaders(definition), baseUrl: remembered.root },
+              source: "OAuth",
+            };
+          }
+        }
         clearOAuthRuntimeRoot?.();
         return resolveApiKeyAuth(definition, ctx, credential);
       },
@@ -1867,6 +1894,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
       definition,
       () => oauthRuntimeRoots.delete(definition.name),
       definition.name === PROVIDER_NAME ? resumeMcpDiscovery : undefined,
+      () => oauthRuntimeRoots.get(definition.name),
     );
     if (auth.oauth) {
       if (definition.name === PROVIDER_NAME) {
