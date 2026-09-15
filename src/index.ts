@@ -1225,10 +1225,9 @@ function createProviderAuth(
             }
           : undefined,
       check: async ({ ctx, credential }) => {
-        const baseUrl =
-          credential?.env?.[ENV_BASE_URL] ??
-          definition.baseUrl ??
-          (definition.useDefaultEnv ? await ctx.env(ENV_BASE_URL) : undefined);
+        const liveUrl = credential?.env?.[ENV_BASE_URL];
+        const envUrl = definition.useDefaultEnv ? await ctx.env(ENV_BASE_URL) : undefined;
+        const baseUrl = liveUrl ?? definition.baseUrl ?? envUrl;
         if (!cleanConfig(baseUrl)) return undefined;
         if (credential?.key) return { type: "api_key", source: "stored credential" };
 
