@@ -538,6 +538,108 @@ describe("extension startup", () => {
     expect(mcpKeys).toEqual(["Bearer sk-new"]);
   });
 
+  it.each([
+    [403, {}, "discovery paused until /login litellm"],
+    [200, { tools: [], error: "unexpected_error", message: "private-proxy-text" }, "unexpected proxy error"],
+    [200, { tools: [] }, "no MCP tools were registered"],
+    [200, "x".repeat(5 * 1024 * 1024 + 1), "exceeded its 5242880-byte limit"],
+    [
+      200,
+      {
+        tools: [
+          {
+            name: "search",
+            server_name: "server",
+            inputSchema: { type: "object", properties: { query: { type: "string", pattern: "private-proxy-text" } } },
+          },
+        ],
+      },
+      "safe args envelope",
+    ],
+  ])("routes MCP diagnostics through the active UI %#", async (status, body, expected) => {
+    process.env.LITELLM_MODELS_DEV = "0";
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      if (String(input).endsWith("/mcp-rest/tools/list")) return jsonResponse(status, body);
+      return jsonResponse(200, { data: [{ model_name: "fresh-model", model_info: { mode: "chat" } }] });
+    });
+    const pi = createPi();
+    await (await loadExtension(await makeAgentDir()))(pi);
+    const notify = vi.fn();
+    for (const handler of pi.handlers.get("session_start") ?? [])
+      await handler({ type: "session_start" }, { hasUI: true, ui: { notify } });
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    process.env.LITELLM_VERBOSE_DISCOVERY = "1";
+    await refreshProvider(pi.providers[0]!, {
+      allowNetwork: true,
+      credential: { type: "api_key", key: "sk-test", env: { LITELLM_BASE_URL: "https://proxy.example.com" } },
+    });
+    await vi.waitFor(() => expect(notify.mock.calls.flat().join("\n")).toContain(expected));
+    expect(notify.mock.calls.flat().join("\n")).toContain("Querying MCP tools/list endpoint");
+    expect(notify.mock.calls.flat().join("\n")).not.toContain("private-proxy-text");
+    expect(stderr.mock.calls.flat().join("\n")).not.toContain("MCP");
+  });
+
+  it("routes MCP tool-call safety diagnostics through the active UI", async () => {
+    process.env.LITELLM_MODELS_DEV = "0";
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = String(input);
+      if (url.endsWith("/mcp-rest/tools/call")) return new Response("x".repeat(5 * 1024 * 1024 + 1));
+      if (url.endsWith("/mcp-rest/tools/list"))
+        return jsonResponse(200, {
+          tools: [{ name: "search", server_name: "server", inputSchema: { type: "object", properties: {} } }],
+        });
+      return jsonResponse(200, { data: [{ model_name: "fresh-model", model_info: { mode: "chat" } }] });
+    });
+    const pi = createPi();
+    await (await loadExtension(await makeAgentDir()))(pi);
+    const notify = vi.fn();
+    for (const handler of pi.handlers.get("session_start") ?? [])
+      await handler({ type: "session_start" }, { hasUI: true, ui: { notify } });
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    await refreshProvider(pi.providers[0]!, {
+      allowNetwork: true,
+      credential: { type: "api_key", key: "sk-test", env: { LITELLM_BASE_URL: "https://proxy.example.com" } },
+    });
+    await vi.waitFor(() => expect(pi.tools.map((tool) => tool.name)).toContainEqual(named("mcp_server_search")));
+    const tool = pi.tools.find((tool) => tool.name.startsWith("mcp_"));
+    await expect(tool?.execute?.("test-call", {}, new AbortController().signal)).rejects.toThrow(
+      "exceeds its 5242880-byte limit",
+    );
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining("MCP tool call response exceeded"), "warning");
+    expect(stderr).not.toHaveBeenCalled();
+  });
+
+  it("buffers MCP warnings before the TUI context is available", async () => {
+    process.env.LITELLM_MODELS_DEV = "0";
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) =>
+      String(input).endsWith("/mcp-rest/tools/list")
+        ? jsonResponse(403, {})
+        : jsonResponse(200, { data: [{ model_name: "fresh-model", model_info: { mode: "chat" } }] }),
+    );
+    const agentDir = await makeAgentDir();
+    const pi = createPi();
+    await (await loadExtension(agentDir))(pi);
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const isTTY = Object.getOwnPropertyDescriptor(process.stderr, "isTTY");
+    Object.defineProperty(process.stderr, "isTTY", { configurable: true, value: true });
+    try {
+      await refreshProvider(pi.providers[0]!, {
+        allowNetwork: true,
+        credential: { type: "api_key", key: "sk-test", env: { LITELLM_BASE_URL: "https://proxy.example.com" } },
+      });
+      await vi.waitFor(async () => expect(await readFile(join(agentDir, "litellm-mcp-paused"), "utf8")).toBe(""));
+      expect(stderr).not.toHaveBeenCalled();
+      const notify = vi.fn();
+      for (const handler of pi.handlers.get("session_start") ?? [])
+        await handler({ type: "session_start" }, { hasUI: true, ui: { notify } });
+      expect(notify).toHaveBeenCalledWith(expect.stringContaining("discovery paused until /login litellm"), "warning");
+      expect(stderr).not.toHaveBeenCalled();
+    } finally {
+      if (isTTY) Object.defineProperty(process.stderr, "isTTY", isTTY);
+      else Reflect.deleteProperty(process.stderr, "isTTY");
+    }
+  });
+
   it("retries a partial-failure catalog and registers tools from the clean refresh", async () => {
     process.env.LITELLM_MODELS_DEV = "0";
     let listCalls = 0;

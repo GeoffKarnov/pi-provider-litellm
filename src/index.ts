@@ -1510,6 +1510,29 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   const mcpEnabled = isFeatureEnabled(settings, "mcp");
   const providerNames = new Set(definitions.map((definition) => definition.name));
   const oauthRuntimeRoots = new Map<string, { apiKey: string; root: string }>();
+  let mcpUI: ExtensionContext["ui"] | undefined;
+  let sessionStarted = false;
+  const pendingMcpMessages = new Map<string, "info" | "warning">();
+
+  function notifyMcp(message: string, level: "info" | "warning" = "warning"): void {
+    const text = message.trimEnd();
+    if (mcpUI) mcpUI.notify(text, level);
+    // Pi starts the terminal before supplying an ExtensionContext. Buffer until session_start.
+    else if (!sessionStarted && process.stderr.isTTY) pendingMcpMessages.set(text, level);
+    else process.stderr.write(`${text}\n`);
+  }
+
+  pi.on("session_start", (_event, ctx) => {
+    sessionStarted = true;
+    mcpUI = ctx.hasUI ? ctx.ui : undefined;
+    for (const [message, level] of pendingMcpMessages) notifyMcp(message, level);
+    pendingMcpMessages.clear();
+  });
+  pi.on("session_shutdown", () => {
+    mcpUI = undefined;
+    sessionStarted = false;
+    pendingMcpMessages.clear();
+  });
 
   function discoveryDisabledReason(): string | null {
     if (isOffline()) return `${ENV_OFFLINE}=1`;
@@ -1571,7 +1594,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
       rmSync(mcpPausePath, { force: true });
       mcpPauseInMemory = false;
     } catch {
-      process.stderr.write("LiteLLM MCP: could not clear the persisted discovery pause.\n");
+      notifyMcp("LiteLLM MCP: could not clear the persisted discovery pause.");
     }
   }
 
@@ -1664,8 +1687,9 @@ export default async function (pi: ExtensionAPI): Promise<void> {
         signal?.throwIfAborted();
         const { definitions, report } = await createMcpToolDefinitions(
           (ctx) => (ctx?.modelRegistry ? resolveDefaultRuntimeAuth(ctx) : Promise.resolve(auth)),
-          isVerboseDiscovery() ? (message) => process.stderr.write(`LiteLLM MCP: ${message}\n`) : undefined,
+          isVerboseDiscovery() ? (message) => notifyMcp(`LiteLLM MCP: ${message}`, "info") : undefined,
           signal,
+          notifyMcp,
         );
         signal?.throwIfAborted();
         if (loginGeneration !== mcpLoginGeneration) return;
@@ -1683,21 +1707,22 @@ export default async function (pi: ExtensionAPI): Promise<void> {
           // Fatal for this instance: report once, with a bounded Pi-authored cause and no proxy text,
           // then stop retrying so a stale instance cannot churn discovery on every later refresh.
           mcpRegistrationFatal = true;
-          reportMcpRegistrationFatal(registeredNames.length, definitions.length, error);
+          reportMcpRegistrationFatal(registeredNames.length, definitions.length, error, notifyMcp);
           return;
         }
         reportMcpRegistrationSuccess();
-        reportMcpPartialDiscovery(report.partialFailure, registeredNames);
+        reportMcpPartialDiscovery(report.partialFailure, registeredNames, notifyMcp);
         if (isVerboseDiscovery()) {
-          process.stderr.write(
+          notifyMcp(
             `LiteLLM MCP: registered ${registeredNames.length} of ${definitions.length} prepared MCP tools ` +
-              `(${report.discovered} raw, ${report.enveloped} enveloped).\n`,
+              `(${report.discovered} raw, ${report.enveloped} enveloped).`,
+            "info",
           );
         }
         // A catalog that produced nothing or came from a partial-failure response is not settled:
         // leaving the identity unset lets a later refresh retry discovery, which is network-only and
         // non-blocking. Re-registering surviving tools is safe because Pi replaces tools by name.
-        reportMcpCatalogOutcome(report.discovered, definitions.length);
+        reportMcpCatalogOutcome(report.discovered, definitions.length, notifyMcp);
         if (definitions.length > 0 && !report.partialFailure) registeredMcpIdentity = identity;
       } catch (error) {
         if (signal?.aborted) throw signal.reason;
@@ -1708,13 +1733,13 @@ export default async function (pi: ExtensionAPI): Promise<void> {
             writeFileSync(mcpPausePath, "", { mode: 0o600 });
           } catch {
             mcpPauseInMemory = true;
-            process.stderr.write("LiteLLM MCP: could not persist the discovery pause across restarts.\n");
+            notifyMcp("LiteLLM MCP: could not persist the discovery pause across restarts.");
           }
-          process.stderr.write("LiteLLM MCP: access denied; discovery paused until /login litellm succeeds.\n");
+          notifyMcp("LiteLLM MCP: access denied; discovery paused until /login litellm succeeds.");
           return;
         }
-        process.stderr.write(
-          `LiteLLM (${PROVIDER_NAME}): MCP tool discovery failed (${error instanceof Error ? error.message : String(error)}).\n`,
+        notifyMcp(
+          `LiteLLM (${PROVIDER_NAME}): MCP tool discovery failed (${error instanceof Error ? error.message : String(error)}).`,
         );
       }
     })();

@@ -27,6 +27,8 @@ const TRUNCATION_MARKER = "\n[truncated by pi-provider-litellm]";
 const DESCRIPTION_TRUNCATION_MARKER = "… [truncated]";
 const SHORT_TRUNCATION_MARKER = "…";
 
+type DiagnosticSink = (message: string) => void;
+
 interface RawLiteLLMMcpTool {
   name?: unknown;
   description?: unknown;
@@ -120,10 +122,17 @@ const lastEmittedIncident = new Map<string, string>();
 // Reports an incident unless its identity is unchanged since the last report of that class.
 // `identity` must capture everything an operator would want to hear about again — for tool
 // incidents that is the full sorted membership, not just the bounded sample that gets printed.
-function emitSafetyDiagnostic(incident: string, message: string, identity: string = message): void {
+function emitSafetyDiagnostic(
+  incident: string,
+  message: string,
+  identity: string = message,
+  onDiagnostic: DiagnosticSink = (line) => {
+    process.stderr.write(line);
+  },
+): void {
   if (lastEmittedIncident.get(incident) === identity) return;
   lastEmittedIncident.set(incident, identity);
-  process.stderr.write(`LiteLLM MCP: ${message}\n`);
+  onDiagnostic(`LiteLLM MCP: ${message}\n`);
 }
 
 function clearIncident(incident: string): void {
@@ -153,7 +162,12 @@ function sampleList(names: readonly string[]): string {
 // Pi's `registerTool` is a synchronous replace-by-name whose only throw comes from a staleness
 // check that is never reset, so a throw means the pass is over, not that one tool was rejected.
 // `cause` is Pi-authored and bounded; no proxy schema, description, or body reaches stderr.
-export function reportMcpRegistrationFatal(registered: number, attempted: number, cause: unknown): void {
+export function reportMcpRegistrationFatal(
+  registered: number,
+  attempted: number,
+  cause: unknown,
+  onDiagnostic?: DiagnosticSink,
+): void {
   const causeText = truncateUtf8(
     cause instanceof Error ? cause.message : String(cause),
     MAX_DIAGNOSTIC_CAUSE_BYTES,
@@ -163,6 +177,8 @@ export function reportMcpRegistrationFatal(registered: number, attempted: number
     "registration-fatal",
     `registration stopped after ${registered} of ${plural(attempted, "MCP tool")}; ` +
       `no further attempts will be made by this extension instance (${causeText}).`,
+    undefined,
+    onDiagnostic,
   );
 }
 
@@ -174,7 +190,11 @@ export function reportMcpRegistrationSuccess(): void {
 
 // `registered` is the generated names of the tools that survived, so a failure that changes
 // which servers answered is reported again even when the count happens to stay the same.
-export function reportMcpPartialDiscovery(partialFailure: boolean, registered: readonly string[]): void {
+export function reportMcpPartialDiscovery(
+  partialFailure: boolean,
+  registered: readonly string[],
+  onDiagnostic?: DiagnosticSink,
+): void {
   if (!partialFailure) {
     clearIncident("discovery-partial-failure");
     return;
@@ -183,13 +203,14 @@ export function reportMcpPartialDiscovery(partialFailure: boolean, registered: r
     "discovery-partial-failure",
     `proxy reported a partial server failure; ${plural(registered.length, "tool")} registered.`,
     `discovery-partial-failure:${membershipIdentity(registered)}`,
+    onDiagnostic,
   );
 }
 
 // Reports a discovery that yielded no registrable tool, so the silence is explained. A pass that did
 // register something clears the incident, so a later recurrence is reported rather than suppressed as
 // an unchanged message.
-export function reportMcpCatalogOutcome(raw: number, registered: number): void {
+export function reportMcpCatalogOutcome(raw: number, registered: number, onDiagnostic?: DiagnosticSink): void {
   if (registered > 0) {
     clearIncident("empty-catalog");
     return;
@@ -198,6 +219,7 @@ export function reportMcpCatalogOutcome(raw: number, registered: number): void {
     "empty-catalog",
     `no MCP tools were registered from ${plural(raw, "raw entry", "raw entries")} returned by the proxy.`,
     `empty-catalog:${raw}`,
+    onDiagnostic,
   );
 }
 
@@ -246,7 +268,12 @@ function truncateUtf8(value: string, maxBytes: number, marker: string): string {
   return `${source.subarray(0, end).toString("utf8")}${marker}`;
 }
 
-async function readBoundedText(response: Response, limit: number, surface: string): Promise<string> {
+async function readBoundedText(
+  response: Response,
+  limit: number,
+  surface: string,
+  onDiagnostic?: DiagnosticSink,
+): Promise<string> {
   if (!response.body) {
     clearIncident(`${surface}-body-cap`);
     return "";
@@ -262,7 +289,12 @@ async function readBoundedText(response: Response, limit: number, surface: strin
       if (size > limit) {
         // Build the diagnostic and the error before cancelling: `cancel()` rejects with the stream's
         // stored error if the body errored concurrently, which would otherwise discard both.
-        emitSafetyDiagnostic(`${surface}-body-cap`, `${surface} response exceeded its ${limit}-byte limit.`);
+        emitSafetyDiagnostic(
+          `${surface}-body-cap`,
+          `${surface} response exceeded its ${limit}-byte limit.`,
+          undefined,
+          onDiagnostic,
+        );
         const capError = new Error(`${surface} response exceeds its ${limit}-byte limit`);
         await reader.cancel().catch(() => undefined);
         throw capError;
@@ -539,6 +571,7 @@ export async function discoverMcpTools(
   onProgress?: (message: string) => void,
   parentSignal?: AbortSignal,
   allowInsecureHttp = false,
+  onDiagnostic?: DiagnosticSink,
 ): Promise<McpDiscovery> {
   parentSignal?.throwIfAborted();
   onProgress?.("Discovering MCP tools from server...");
@@ -558,7 +591,9 @@ export async function discoverMcpTools(
       if (response.status === 401 || response.status === 403) throw new McpAccessDeniedError();
       throw new Error(`HTTP ${response.status}`);
     }
-    const body = parseDiscoveryJson(await readBoundedText(response, MAX_DISCOVERY_BODY_BYTES, "MCP discovery"));
+    const body = parseDiscoveryJson(
+      await readBoundedText(response, MAX_DISCOVERY_BODY_BYTES, "MCP discovery", onDiagnostic),
+    );
     const bodyRecord = asRecord(body);
     const errorTag = bodyRecord?.error;
     // Older proxies catch their own access denial and wrap it in an HTTP 200 unexpected_error.
@@ -645,6 +680,7 @@ export async function executeMcpTool(
   headers?: Record<string, string>,
   parentSignal?: AbortSignal,
   allowInsecureHttp = false,
+  onDiagnostic?: DiagnosticSink,
 ): Promise<string> {
   parentSignal?.throwIfAborted();
   const signal = boundedSignal(CALL_TIMEOUT_MS, parentSignal);
@@ -661,7 +697,10 @@ export async function executeMcpTool(
       signal,
     });
     if (!response.ok) throw mcpCallError(serverId, toolName, `HTTP ${response.status}`);
-    const body = parseJson(await readBoundedText(response, MAX_CALL_BODY_BYTES, "MCP tool call"), "MCP tool call");
+    const body = parseJson(
+      await readBoundedText(response, MAX_CALL_BODY_BYTES, "MCP tool call", onDiagnostic),
+      "MCP tool call",
+    );
     const bodyRecord = asRecord(body);
     if (bodyRecord?.error != null) {
       throw mcpCallError(serverId, toolName, mcpErrorMessage(bodyRecord.error) ?? "MCP error");
@@ -1169,12 +1208,12 @@ export function prepareTools(discovery: McpDiscovery): {
   return { prepared, report };
 }
 
-function emitPreparationDiagnostics(report: McpPreparationReport): void {
+function emitPreparationDiagnostics(report: McpPreparationReport, onDiagnostic?: DiagnosticSink): void {
   const seen = new Set<string>();
   const emitClass = (reason: McpIncidentReason, message: string, tools: string[]): void => {
     seen.add(reason);
     // Identity covers the full membership, so a change beyond the printed sample still re-reports.
-    emitSafetyDiagnostic(reason, message, `${tools.length}:${membershipIdentity(tools)}`);
+    emitSafetyDiagnostic(reason, message, `${tools.length}:${membershipIdentity(tools)}`, onDiagnostic);
   };
   const dropMemberships = new Map(report.dropMemberships.map(({ reason, identities }) => [reason, identities]));
   for (const { reason, tools } of report.dropped) {
@@ -1200,6 +1239,7 @@ function emitPreparationDiagnostics(report: McpPreparationReport): void {
       "tool-cap",
       `ignoring ${plural(report.overflow, "MCP tool")} beyond the ${MAX_REGISTERED_TOOLS}-tool limit.`,
       `${report.overflow}:${membershipIdentity(report.overflowTools)}`,
+      onDiagnostic,
     );
   }
   // Clear classes that did not recur, so the same incident is reported again if it comes back
@@ -1213,6 +1253,7 @@ export async function createMcpToolDefinitions(
   getAuth: (ctx?: ExtensionContext) => Promise<LiteLLMRuntimeAuth>,
   onProgress?: (message: string) => void,
   signal?: AbortSignal,
+  onDiagnostic?: DiagnosticSink,
 ): Promise<{ definitions: ToolDefinition[]; report: McpPreparationReport }> {
   const discoveryAuth = await getAuth();
   const discovery = await discoverMcpTools(
@@ -1222,9 +1263,10 @@ export async function createMcpToolDefinitions(
     onProgress,
     signal,
     discoveryAuth.allowInsecureHttp,
+    onDiagnostic,
   );
   const { prepared, report } = prepareTools(discovery);
-  emitPreparationDiagnostics(report);
+  emitPreparationDiagnostics(report, onDiagnostic);
   const lostTotal = report.dropped.reduce((total, entry) => total + entry.tools.length, 0) + report.overflow;
   const lostDetail = [
     ...report.dropped.map((entry) => `${entry.reason}=${entry.tools.length}`),
@@ -1275,6 +1317,7 @@ export async function createMcpToolDefinitions(
           auth.headers,
           toolSignal,
           auth.allowInsecureHttp,
+          onDiagnostic,
         );
         return {
           content: [{ type: "text", text }],
