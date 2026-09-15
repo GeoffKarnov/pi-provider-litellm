@@ -1267,17 +1267,28 @@ function createProviderAuth(
       resolve: async ({ ctx, credential }) => {
         // Pi re-resolves auth through this api-key path whenever a caller passes an explicit
         // apiKey override — compaction and summarization both hand back the key they just
-        // resolved — which bypasses the stored OAuth credential carrying the base URL. An SSO
-        // session keeps its root nowhere else, so serve the one remembered for that exact
-        // access token. Only when nothing configures a root at all: a base URL that is set
-        // still resolves, and still fails, on its own terms rather than silently rerouting.
-        const remembered = oauthRuntimeRoot?.();
-        if (remembered && credential?.key === remembered.apiKey) {
-          const configured =
-            (await configuredBaseUrl(definition, ctx, credential)) ?? resolveCredentialRoot(definition, credential);
-          if (!configured) {
+        // resolved — which bypasses the stored OAuth credential carrying the base URL. The
+        // api-key path exports its root as env so it survives that round trip, but OAuth's
+        // toAuth has no env to export, leaving an SSO session no record of its root. Read it
+        // back from auth.json, the same fallback check() and seedModels() use, and export it
+        // so the request carries the root rather than depending on in-memory state. auth.json is
+        // shared, though: another Pi process logging in replaces the stored token while this one
+        // still holds its own, so fall back to the root this process resolved for that exact
+        // token. Only when nothing configures a root at all: a base URL that is set still
+        // resolves, and still fails, on its own terms rather than silently rerouting.
+        if (credential?.key && !(await configuredBaseUrl(definition, ctx, credential))) {
+          const stored = readStoredCredential(definition.name, join(getAgentDir(), "auth.json"));
+          const remembered = oauthRuntimeRoot?.();
+          const root =
+            stored?.type === "oauth" && stored.access === credential.key
+              ? requireCredentialRoot(resolveCredentialRoot(definition, stored), definition.name)
+              : remembered?.apiKey === credential.key
+                ? remembered.root
+                : undefined;
+          if (root) {
             return {
-              auth: { apiKey: remembered.apiKey, headers: resolveHeaders(definition), baseUrl: remembered.root },
+              auth: { apiKey: credential.key, headers: resolveHeaders(definition), baseUrl: root },
+              env: { [ENV_BASE_URL]: root },
               source: "OAuth",
             };
           }

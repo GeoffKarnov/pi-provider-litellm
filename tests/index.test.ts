@@ -1707,29 +1707,42 @@ describe("extension startup", () => {
     ).not.toThrow();
   });
 
+  async function ssoAgentDir(): Promise<string> {
+    const agentDir = await makeAgentDir();
+    await writeFile(
+      join(agentDir, "auth.json"),
+      JSON.stringify({
+        litellm: {
+          type: "oauth",
+          access: "sk-sso",
+          refresh: "",
+          expires: Number.MAX_SAFE_INTEGER,
+          baseUrl: "https://oauth.example.com",
+        },
+      }),
+      "utf8",
+    );
+    return agentDir;
+  }
+
   it("keeps the OAuth base URL when Pi re-resolves auth with the session's own token", async () => {
     delete process.env.LITELLM_BASE_URL;
     delete process.env.LITELLM_API_KEY;
     process.env.LITELLM_DISCOVERY_TIMEOUT_MS = "0";
-    const extension = await loadExtension(await makeAgentDir());
+    const extension = await loadExtension(await ssoAgentDir());
     const pi = createPi();
     await extension(pi);
     const provider = pi.providers[0]!;
 
-    await provider.auth.oauth?.toAuth({
-      type: "oauth" as const,
-      access: "sk-sso",
-      refresh: "",
-      expires: Number.MAX_SAFE_INTEGER,
-      baseUrl: "https://oauth.example.com",
-    });
-
-    // Compaction hands the token it just resolved back as an apiKey override, which sends Pi
-    // down the api-key path with no base URL of its own.
+    // No toAuth() first: the root has to come from auth.json, not from in-memory state that a
+    // later api-key resolve would clear. Compaction hands the token it just resolved back as an
+    // apiKey override, which sends Pi down the api-key path with no base URL of its own.
     await expect(resolveApiKey(provider, { type: "api_key", key: "sk-sso" })).resolves.toMatchObject({
       auth: { apiKey: "sk-sso", baseUrl: "https://oauth.example.com" },
+      env: { LITELLM_BASE_URL: "https://oauth.example.com" },
     });
 
+    // The exported env carries the root, so the request stands on its own.
     expect(() =>
       provider.stream(
         {
@@ -1745,9 +1758,49 @@ describe("extension startup", () => {
           maxTokens: 1024,
         },
         { messages: [] },
-        { apiKey: "sk-sso" },
+        { apiKey: "sk-sso", env: { LITELLM_BASE_URL: "https://oauth.example.com" } },
       ),
     ).not.toThrow();
+  });
+
+  it("keeps this process's root after another process replaces the stored credential", async () => {
+    delete process.env.LITELLM_BASE_URL;
+    delete process.env.LITELLM_API_KEY;
+    process.env.LITELLM_DISCOVERY_TIMEOUT_MS = "0";
+    const agentDir = await ssoAgentDir();
+    const extension = await loadExtension(agentDir);
+    const pi = createPi();
+    await extension(pi);
+    const provider = pi.providers[0]!;
+
+    // This process resolved its own OAuth credential...
+    await provider.auth.oauth?.toAuth({
+      type: "oauth" as const,
+      access: "sk-live",
+      refresh: "",
+      expires: Number.MAX_SAFE_INTEGER,
+      baseUrl: "https://live.example.com",
+    });
+    // ...and then another Pi process logged in, replacing the shared auth.json token. This
+    // process keeps its own login, so its root must still resolve for its own token.
+    await writeFile(
+      join(agentDir, "auth.json"),
+      JSON.stringify({
+        litellm: {
+          type: "oauth",
+          access: "sk-other",
+          refresh: "",
+          expires: Number.MAX_SAFE_INTEGER,
+          baseUrl: "https://other.example.com",
+        },
+      }),
+      "utf8",
+    );
+
+    await expect(resolveApiKey(provider, { type: "api_key", key: "sk-live" })).resolves.toMatchObject({
+      auth: { apiKey: "sk-live", baseUrl: "https://live.example.com" },
+      env: { LITELLM_BASE_URL: "https://live.example.com" },
+    });
   });
 
   it.each([
@@ -1757,21 +1810,13 @@ describe("extension startup", () => {
     delete process.env.LITELLM_API_KEY;
     process.env.LITELLM_BASE_URL = baseUrl;
     process.env.LITELLM_DISCOVERY_TIMEOUT_MS = "0";
-    const extension = await loadExtension(await makeAgentDir());
+    const extension = await loadExtension(await ssoAgentDir());
     const pi = createPi();
     await extension(pi);
     const provider = pi.providers[0]!;
 
-    await provider.auth.oauth?.toAuth({
-      type: "oauth" as const,
-      access: "sk-sso",
-      refresh: "",
-      expires: Number.MAX_SAFE_INTEGER,
-      baseUrl: "https://oauth.example.com",
-    });
-
-    // A configured base URL must fail on its own terms — never fall back to the remembered
-    // OAuth root, which would silently reroute the request past the guard that rejected it.
+    // A configured base URL must fail on its own terms — never fall back to the stored OAuth
+    // root, which would silently reroute the request past the guard that rejected it.
     await expect(resolveApiKey(provider, { type: "api_key", key: "sk-sso" })).rejects.toThrow(expected);
   });
 
