@@ -1498,6 +1498,23 @@ describe("extension startup", () => {
       await expect(pi.providers[0]?.auth.oauth?.refresh(credential, TEST_SIGNAL)).resolves.toEqual(credential);
     });
 
+    it("keeps fresh PKCE credentials when the internal refresh deadline elapses", async () => {
+      process.env.LITELLM_DISCOVERY_TIMEOUT_MS = "0";
+      const extension = await loadExtension(await makeAgentDir());
+      const pi = createPi();
+      await extension(pi);
+      vi.spyOn(AbortSignal, "timeout").mockImplementation(() =>
+        AbortSignal.abort(new DOMException("timed out", "TimeoutError")),
+      );
+      vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
+        init?.signal?.throwIfAborted();
+        return jsonResponse(200, {});
+      });
+      const credential = pkceCredential();
+
+      await expect(pi.providers[0]?.auth.oauth?.refresh(credential, undefined as never)).resolves.toEqual(credential);
+    });
+
     it("rejects a transient PKCE refresh failure after expiry", async () => {
       const now = 1_800_000_000_000;
       process.env.LITELLM_DISCOVERY_TIMEOUT_MS = "0";

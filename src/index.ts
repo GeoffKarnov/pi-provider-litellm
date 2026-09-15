@@ -669,7 +669,7 @@ async function discoverPkce(
 async function requestPkceToken(
   endpoint: string,
   form: URLSearchParams,
-  signal: AbortSignal,
+  signal: AbortSignal | undefined,
   headers?: Record<string, string>,
   existingRefreshToken?: string,
 ): Promise<PkceTokenResult> {
@@ -683,7 +683,7 @@ async function requestPkceToken(
       signal: boundedLoginSignal(signal),
     });
   } catch {
-    if (signal.aborted) throw signal.reason;
+    if (signal?.aborted) throw signal.reason;
     return { ok: false, transient: true, message: "LiteLLM token exchange failed (network error)" };
   }
   let data: Record<string, unknown> | undefined;
@@ -691,12 +691,12 @@ async function requestPkceToken(
     const parsed = (await response.json()) as unknown;
     if (isPlainObject(parsed)) data = parsed;
   } catch (error) {
-    if (signal.aborted) throw signal.reason;
+    if (signal?.aborted) throw signal.reason;
     if (response.ok && !(error instanceof SyntaxError)) {
       return { ok: false, transient: true, message: "LiteLLM token exchange failed (network error)" };
     }
   }
-  signal.throwIfAborted();
+  signal?.throwIfAborted();
   if (!response.ok) {
     return {
       ok: false,
@@ -858,7 +858,7 @@ async function loginPkce(
         code_verifier: verifier,
         resource: discovery.resource,
       }),
-      interaction.signal ?? AbortSignal.timeout(LOGIN_TIMEOUT_MS),
+      interaction.signal,
       headers,
     );
     if (!result.ok) throw new Error(result.message);
@@ -1098,7 +1098,7 @@ async function refreshLiteLLM(
         client_id: credentials.clientId,
         resource,
       }),
-      signal ?? AbortSignal.timeout(LOGIN_TIMEOUT_MS),
+      signal,
       resolveHeaders(definition),
       credentials.refresh,
     );
