@@ -1209,6 +1209,7 @@ function createProviderAuth(
   definition: ProviderDefinition,
   clearOAuthRuntimeRoot?: () => void,
   onLogin?: () => void,
+  oauthRuntimeRoot?: () => { apiKey: string; root: string } | undefined,
 ): ProviderAuth {
   function completeLogin<T extends Credential>(credential: T): T {
     onLogin?.();
@@ -1255,8 +1256,26 @@ function createProviderAuth(
         return fallback ? { type: "api_key", source: fallback } : undefined;
       },
       resolve: async ({ ctx, credential }) => {
-        clearOAuthRuntimeRoot?.();
-        return resolveApiKeyAuth(definition, ctx, credential);
+        const remembered = oauthRuntimeRoot?.();
+        try {
+          const resolved = await resolveApiKeyAuth(definition, ctx, credential);
+          clearOAuthRuntimeRoot?.();
+          return resolved;
+        } catch (error) {
+          // Pi re-resolves auth through this api-key path whenever a caller passes an explicit
+          // apiKey override — compaction and summarization both hand back the key they just
+          // resolved — which bypasses the stored OAuth credential carrying the base URL. An SSO
+          // session keeps its root nowhere else, so serve the one remembered for that exact
+          // access token instead of failing the request.
+          if (!remembered || credential?.key !== remembered.apiKey) {
+            clearOAuthRuntimeRoot?.();
+            throw error;
+          }
+          return {
+            auth: { apiKey: remembered.apiKey, headers: resolveHeaders(definition), baseUrl: remembered.root },
+            source: "OAuth",
+          };
+        }
       },
     },
     oauth: definition.enableOAuth
@@ -1867,6 +1886,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
       definition,
       () => oauthRuntimeRoots.delete(definition.name),
       definition.name === PROVIDER_NAME ? resumeMcpDiscovery : undefined,
+      () => oauthRuntimeRoots.get(definition.name),
     );
     if (auth.oauth) {
       if (definition.name === PROVIDER_NAME) {
