@@ -1218,6 +1218,7 @@ function createProviderAuth(
   definition: ProviderDefinition,
   clearOAuthRuntimeRoot?: () => void,
   onLogin?: () => void,
+  oauthRuntimeRoot?: () => { apiKey: string; root: string } | undefined,
 ): ProviderAuth {
   function completeLogin<T extends Credential>(credential: T): T {
     onLogin?.();
@@ -1270,13 +1271,21 @@ function createProviderAuth(
         // api-key path exports its root as env so it survives that round trip, but OAuth's
         // toAuth has no env to export, leaving an SSO session no record of its root. Read it
         // back from auth.json, the same fallback check() and seedModels() use, and export it
-        // so the request carries the root rather than depending on in-memory state. Only when
-        // nothing configures a root at all: a base URL that is set still resolves, and still
-        // fails, on its own terms rather than silently rerouting.
+        // so the request carries the root rather than depending on in-memory state. auth.json is
+        // shared, though: another Pi process logging in replaces the stored token while this one
+        // still holds its own, so fall back to the root this process resolved for that exact
+        // token. Only when nothing configures a root at all: a base URL that is set still
+        // resolves, and still fails, on its own terms rather than silently rerouting.
         if (credential?.key && !(await configuredBaseUrl(definition, ctx, credential))) {
           const stored = readStoredCredential(definition.name, join(getAgentDir(), "auth.json"));
-          if (stored?.type === "oauth" && stored.access === credential.key) {
-            const root = requireCredentialRoot(resolveCredentialRoot(definition, stored), definition.name);
+          const remembered = oauthRuntimeRoot?.();
+          const root =
+            stored?.type === "oauth" && stored.access === credential.key
+              ? requireCredentialRoot(resolveCredentialRoot(definition, stored), definition.name)
+              : remembered?.apiKey === credential.key
+                ? remembered.root
+                : undefined;
+          if (root) {
             return {
               auth: { apiKey: credential.key, headers: resolveHeaders(definition), baseUrl: root },
               env: { [ENV_BASE_URL]: root },
@@ -1896,6 +1905,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
       definition,
       () => oauthRuntimeRoots.delete(definition.name),
       definition.name === PROVIDER_NAME ? resumeMcpDiscovery : undefined,
+      () => oauthRuntimeRoots.get(definition.name),
     );
     if (auth.oauth) {
       if (definition.name === PROVIDER_NAME) {

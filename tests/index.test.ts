@@ -1763,6 +1763,46 @@ describe("extension startup", () => {
     ).not.toThrow();
   });
 
+  it("keeps this process's root after another process replaces the stored credential", async () => {
+    delete process.env.LITELLM_BASE_URL;
+    delete process.env.LITELLM_API_KEY;
+    process.env.LITELLM_DISCOVERY_TIMEOUT_MS = "0";
+    const agentDir = await ssoAgentDir();
+    const extension = await loadExtension(agentDir);
+    const pi = createPi();
+    await extension(pi);
+    const provider = pi.providers[0]!;
+
+    // This process resolved its own OAuth credential...
+    await provider.auth.oauth?.toAuth({
+      type: "oauth" as const,
+      access: "sk-live",
+      refresh: "",
+      expires: Number.MAX_SAFE_INTEGER,
+      baseUrl: "https://live.example.com",
+    });
+    // ...and then another Pi process logged in, replacing the shared auth.json token. This
+    // process keeps its own login, so its root must still resolve for its own token.
+    await writeFile(
+      join(agentDir, "auth.json"),
+      JSON.stringify({
+        litellm: {
+          type: "oauth",
+          access: "sk-other",
+          refresh: "",
+          expires: Number.MAX_SAFE_INTEGER,
+          baseUrl: "https://other.example.com",
+        },
+      }),
+      "utf8",
+    );
+
+    await expect(resolveApiKey(provider, { type: "api_key", key: "sk-live" })).resolves.toMatchObject({
+      auth: { apiKey: "sk-live", baseUrl: "https://live.example.com" },
+      env: { LITELLM_BASE_URL: "https://live.example.com" },
+    });
+  });
+
   it.each([
     ["placeholder", "https://litellm.example.com", /placeholder LiteLLM base URL/],
     ["insecure", "http://insecure.example.com", /http/i],
