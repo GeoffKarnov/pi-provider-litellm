@@ -234,12 +234,18 @@ const credentialIdentitySalt = randomBytes(32);
 // Covers the headers as well as the key: `LITELLM_HEADERS` can carry its own authorization material,
 // so fingerprinting the key alone would leave secrets in the identity. Any change to either yields a
 // different fingerprint, which is what the catalog needs in order to notice a credential change.
-export function credentialFingerprint(apiKey: string, headers?: Record<string, string>): string {
+// Durable pause records supply a private agent-directory salt; ordinary catalog identities keep
+// using the per-process default above.
+export function credentialFingerprint(
+  apiKey: string,
+  headers?: Record<string, string>,
+  salt: Uint8Array = credentialIdentitySalt,
+): string {
   const material = JSON.stringify([
     apiKey,
     Object.entries(headers ?? {}).sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0)),
   ]);
-  return createHmac("sha256", credentialIdentitySalt).update(material).digest("hex").slice(0, 32);
+  return createHmac("sha256", salt).update(material).digest("hex").slice(0, 32);
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
