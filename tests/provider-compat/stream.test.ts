@@ -637,8 +637,9 @@ describe("advertised thinking levels are transmissible", () => {
 describe("advertised levels serialize on both APIs", () => {
   // Values each API actually accepts. Chat carries a level through
   // `reasoning_effort` or a `thinking` payload; Responses carries `reasoning.effort`
-  // and has no `off`/`max` effort.
-  const RESPONSES_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
+  // and has no `off` effort — `none` is its disable spelling. `max` is a real
+  // Responses effort on `gpt-5.6-*`, so it is accepted here too.
+  const RESPONSES_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh", "max"]);
 
   const BACKENDS = [
     "moonshot/kimi-k2.5",
@@ -685,8 +686,8 @@ describe("advertised levels serialize on both APIs", () => {
         const reasoning = body.reasoning as { effort?: string } | undefined;
         expect(params?.includes("reasoning_effort"), `${label} lacks accepted Responses control evidence`).toBe(true);
         expect(reasoning?.effort, `${label} sent no reasoning.effort`).toBeDefined();
-        // `off` and `max` are not Responses efforts; a Chat-shaped map leaking
-        // through would emit exactly those.
+        // `off` is not a Responses effort; a Chat-shaped map leaking through
+        // would emit exactly that.
         expect(RESPONSES_EFFORTS.has(String(reasoning?.effort)), `${label} effort=${reasoning?.effort}`).toBe(true);
       } else {
         const carried = ["reasoning_effort", "thinking", "reasoning"].filter((key) => body[key] !== undefined);
@@ -699,5 +700,30 @@ describe("advertised levels serialize on both APIs", () => {
       // standard level upstream.
       expect(model.thinkingLevelMap).toEqual(NO_LEVELS);
     }
+  });
+
+  // None of the swept backends advertise `max`, so the real serializer never saw
+  // it. This pins the value the Responses allowlist now admits.
+  it("serializes max as a Responses effort when the router advertises it", async () => {
+    const { models, model, requests, respond } = await createCompatibilityHarness([
+      {
+        model_name: "max-route",
+        litellm_params: { model: "openai/gpt-5.6-sol", allowed_openai_params: ["reasoning_effort"] },
+        model_info: {
+          id: "d1",
+          mode: "responses",
+          supports_reasoning: true,
+          supports_max_reasoning_effort: true,
+          supports_xhigh_reasoning_effort: true,
+        },
+      },
+    ]);
+
+    expect(model.api).toBe("openai-responses");
+    expect(getSupportedThinkingLevels(model)).toContain("max");
+
+    respond(...successfulResponsesReply("ok"));
+    await models.streamSimple(model, { messages: [user("Think")] }, { reasoning: "max" }).result();
+    expect(requests.at(-1)).toMatchObject({ reasoning: { effort: "max" } });
   });
 });
