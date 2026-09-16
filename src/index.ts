@@ -8,6 +8,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import type {
   ApiKeyCredential,
   AssistantMessage,
+  AuthCheck,
   AuthInteraction,
   Credential,
   Model,
@@ -134,6 +135,38 @@ function effectiveBaseUrl(definition: ProviderDefinition): string | undefined {
 
 function baseUrlMissing(credential: ApiKeyCredential | undefined, definition: ProviderDefinition): boolean {
   return !(credential?.env?.[ENV_BASE_URL] ?? effectiveBaseUrl(definition));
+}
+
+async function credentialSource(
+  definition: ProviderDefinition,
+  ctx: { env(name: string): Promise<string | undefined> },
+  credential: ApiKeyCredential | undefined,
+): Promise<AuthCheck | undefined> {
+  if (credential?.key) return { type: "api_key", source: "stored credential" };
+  const stored = readStoredCredential(definition.name, join(getAgentDir(), "auth.json"));
+  if (stored?.key) return { type: "api_key", source: "auth.json" };
+
+  // Credentials `resolve` would fall back to if ADC cannot mint a token.
+  const fallbackSource = async (): Promise<string | undefined> => {
+    if (definition.apiKeyConfig) {
+      const configuredKey = definition.apiKeyConfig.startsWith("!")
+        ? definition.apiKeyConfig
+        : await resolveTemplateConfigValueFromContext(definition.apiKeyConfig, ctx.env);
+      if (configuredKey) return definition.apiKeyConfig;
+    }
+    if (definition.useDefaultEnv && cleanConfig(await ctx.env(ENV_API_KEY_HELPER))) return ENV_API_KEY_HELPER;
+    if (definition.useDefaultEnv && cleanConfig(await ctx.env(ENV_API_KEY))) return ENV_API_KEY;
+    return undefined;
+  };
+
+  // Mirror the precedence in `resolveCredentials`, where ADC outranks the config
+  // key, the helper and the environment key. Whether the refresh token still mints
+  // is only knowable at request time, and this must not make a network call; if it
+  // fails, `resolve` falls back and reports the credential it actually used.
+  if (definition.useGcloudTokenAuth && isGcloudTokenAuthEnabled() && (await hasGcloudAdcCredentials()))
+    return { type: "api_key", source: GCLOUD_ADC_SOURCE };
+  const fallback = await fallbackSource();
+  return fallback ? { type: "api_key", source: fallback } : undefined;
 }
 
 function requireCredentialRoot(root: string | undefined, providerName: string): string {
@@ -1249,31 +1282,7 @@ function createProviderAuth(
           : undefined,
       check: async ({ ctx, credential }) => {
         if (baseUrlMissing(credential, definition)) return undefined;
-        const stored = readStoredCredential(definition.name, join(getAgentDir(), "auth.json"));
-        if (credential?.key) return { type: "api_key", source: "stored credential" };
-        if (stored?.key) return { type: "api_key", source: "auth.json" };
-
-        // Credentials `resolve` would fall back to if ADC cannot mint a token.
-        const fallbackSource = async (): Promise<string | undefined> => {
-          if (definition.apiKeyConfig) {
-            const configuredKey = definition.apiKeyConfig.startsWith("!")
-              ? definition.apiKeyConfig
-              : await resolveTemplateConfigValueFromContext(definition.apiKeyConfig, ctx.env);
-            if (configuredKey) return definition.apiKeyConfig;
-          }
-          if (definition.useDefaultEnv && cleanConfig(await ctx.env(ENV_API_KEY_HELPER))) return ENV_API_KEY_HELPER;
-          if (definition.useDefaultEnv && cleanConfig(await ctx.env(ENV_API_KEY))) return ENV_API_KEY;
-          return undefined;
-        };
-
-        // Mirror the precedence in `resolveCredentials`, where ADC outranks the config
-        // key, the helper and the environment key. Whether the refresh token still mints
-        // is only knowable at request time, and this must not make a network call; if it
-        // fails, `resolve` falls back and reports the credential it actually used.
-        if (definition.useGcloudTokenAuth && isGcloudTokenAuthEnabled() && (await hasGcloudAdcCredentials()))
-          return { type: "api_key", source: GCLOUD_ADC_SOURCE };
-        const fallback = await fallbackSource();
-        return fallback ? { type: "api_key", source: fallback } : undefined;
+        return credentialSource(definition, ctx, credential);
       },
       resolve: async ({ ctx, credential }) => {
         // Pi re-resolves auth through this api-key path whenever a caller passes an explicit
