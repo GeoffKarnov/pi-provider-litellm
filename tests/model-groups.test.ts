@@ -141,6 +141,19 @@ describe("toResponsesLevels", () => {
         medium: "medium",
         high: "high",
         xhigh: "xhigh",
+        max: "max",
+      },
+    },
+    {
+      name: "a Chat-only value with no Responses spelling",
+      levels: { high: "off" },
+      expected: {
+        off: "none",
+        minimal: "minimal",
+        low: "low",
+        medium: "medium",
+        high: null,
+        xhigh: null,
         max: null,
       },
     },
@@ -255,7 +268,7 @@ describe("closeSerializerPolicy", () => {
       medium: "medium",
       high: "high",
       xhigh: null,
-      max: null,
+      max: "max",
     });
   });
 

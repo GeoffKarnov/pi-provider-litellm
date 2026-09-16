@@ -982,6 +982,101 @@ describe("discoverModels via /model/info", () => {
     });
   });
 
+  it("maps router medium and high effort flags for a singleton", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      jsonResponse(200, {
+        data: [
+          {
+            model_name: "custom/reasoner",
+            litellm_params: { allowed_openai_params: ["reasoning_effort"] },
+            model_info: {
+              mode: "chat",
+              supports_reasoning: true,
+              supports_none_reasoning_effort: true,
+              supports_low_reasoning_effort: true,
+              supports_medium_reasoning_effort: true,
+              supports_high_reasoning_effort: true,
+              supports_xhigh_reasoning_effort: true,
+              supports_max_reasoning_effort: true,
+            },
+          },
+        ],
+      }),
+    );
+
+    const result = await discoverModels("https://litellm.example.com", "sk-test", { modelsDev: false });
+
+    expect(result.models[0]?.thinkingLevelMap).toMatchObject({
+      off: "none",
+      low: "low",
+      medium: "medium",
+      high: "high",
+      xhigh: "xhigh",
+      max: "max",
+    });
+  });
+
+  it("denies medium and high when the router reports them unsupported", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      jsonResponse(200, {
+        data: [
+          {
+            model_name: "custom/reasoner",
+            litellm_params: { allowed_openai_params: ["reasoning_effort"] },
+            model_info: {
+              mode: "chat",
+              supports_reasoning: true,
+              supports_low_reasoning_effort: true,
+              supports_medium_reasoning_effort: false,
+              supports_high_reasoning_effort: false,
+            },
+          },
+        ],
+      }),
+    );
+
+    const result = await discoverModels("https://litellm.example.com", "sk-test", { modelsDev: false });
+
+    expect(result.models[0]?.thinkingLevelMap).toMatchObject({ low: "low", medium: null, high: null });
+  });
+
+  it("keeps max selectable on a Responses route that opts into it", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      jsonResponse(200, {
+        data: [
+          {
+            model_name: "high",
+            litellm_params: { model: "chatgpt/gpt-5.6-sol" },
+            model_info: {
+              mode: "responses",
+              litellm_provider: "chatgpt",
+              supported_openai_params: ["reasoning_effort"],
+              supports_reasoning: true,
+              supports_none_reasoning_effort: true,
+              supports_low_reasoning_effort: true,
+              supports_medium_reasoning_effort: true,
+              supports_high_reasoning_effort: true,
+              supports_xhigh_reasoning_effort: true,
+              supports_max_reasoning_effort: true,
+            },
+          },
+        ],
+      }),
+    );
+
+    const result = await discoverModels("https://litellm.example.com", "sk-test", { modelsDev: false });
+
+    expect(result.models[0]?.api).toBe("openai-responses");
+    expect(result.models[0]?.thinkingLevelMap).toMatchObject({
+      off: "none",
+      low: "low",
+      medium: "medium",
+      high: "high",
+      xhigh: "xhigh",
+      max: "max",
+    });
+  });
+
   it("merges singleton router effort flags into supported Responses levels", async () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(
       jsonResponse(200, {
@@ -1002,7 +1097,7 @@ describe("discoverModels via /model/info", () => {
 
     const result = await discoverModels("https://litellm.example.com", "sk-test", { modelsDev: false });
 
-    expect(result.models[0]?.thinkingLevelMap).toMatchObject({ off: "none", xhigh: null, max: null });
+    expect(result.models[0]?.thinkingLevelMap).toMatchObject({ off: "none", xhigh: null, max: "max" });
   });
 
   it("uses family-only identity to look up models.dev under its public provider", async () => {
@@ -1121,7 +1216,7 @@ describe("discoverModels via /model/info", () => {
     ]);
   });
 
-  it("preserves catalog xhigh while denying literal max on Responses", async () => {
+  it("preserves catalog xhigh and max on Responses", async () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(
       jsonResponse(200, {
         data: [
@@ -1136,7 +1231,7 @@ describe("discoverModels via /model/info", () => {
 
     const result = await discoverModels("https://litellm.example.com", "sk-test", { modelsDev: false });
 
-    expect(result.models[0]?.thinkingLevelMap).toMatchObject({ off: "none", xhigh: "xhigh", max: null });
+    expect(result.models[0]?.thinkingLevelMap).toMatchObject({ off: "none", xhigh: "xhigh", max: "max" });
   });
 
   it("reduces duplicate model ids conservatively instead of merging richer fields", async () => {

@@ -169,13 +169,12 @@ function explicitLimit(value: number | undefined): number | undefined {
 
 const EXTENDED_LEVELS = THINKING_LEVEL_DEFINITIONS.map(([level]) => level);
 
-const LITELLM_LEVEL_FLAGS = {
-  off: "supports_none_reasoning_effort",
-  minimal: "supports_minimal_reasoning_effort",
-  low: "supports_low_reasoning_effort",
-  xhigh: "supports_xhigh_reasoning_effort",
-  max: "supports_max_reasoning_effort",
-} as const;
+// Derived from the level table rather than restated: a second hand-written copy
+// silently dropped `supports_medium_reasoning_effort` and
+// `supports_high_reasoning_effort`, so those router flags were never read.
+const LITELLM_LEVEL_FLAGS = Object.fromEntries(THINKING_LEVEL_DEFINITIONS.map(([level, , flag]) => [level, flag])) as {
+  [Definition in (typeof THINKING_LEVEL_DEFINITIONS)[number] as Definition[0]]: Definition[2];
+};
 
 function normalizeEffort(level: string): (typeof EXTENDED_LEVELS)[number] | undefined {
   const normalized = level === "none" ? "off" : level;
@@ -273,9 +272,10 @@ export const NO_TRANSMISSIBLE_LEVELS = {
 
 // Efforts the Responses API accepts. pi-ai passes an unmapped level through
 // verbatim and reads `thinkingLevelMap.off` as the disable value, so a Chat-shaped
-// map would emit `off` or `max` as an effort. `none` is the disable spelling —
-// pi-ai's own `openai/gpt-5.5` entry maps `off` to it.
-const RESPONSES_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
+// map would emit `off` as an effort. `none` is the disable spelling — pi-ai's own
+// `openai/gpt-5.5` entry maps `off` to it, and its `openai/gpt-5.6-*` entries map
+// `max` to itself, so `max` is a real Responses effort and not a Chat-only value.
+const RESPONSES_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh", "max"]);
 
 // A level map is only meaningful next to the compat that serializes it, and the
 // two used to travel separately: five call sites each decided whether to copy
