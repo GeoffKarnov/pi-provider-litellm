@@ -1463,11 +1463,11 @@ describe("extension startup", () => {
     expect(await readHelperCount(agentDir)).toBe(0);
   });
 
-  it("check() recognises a stored /login credential when no env vars are set", async () => {
+  it("filterModels() does not hide seeded models when no credential has been resolved yet", async () => {
     // Regression test for https://github.com/balcsida/pi-provider-litellm/issues/174:
-    // Pi calls check() at startup with credential=undefined before resolving auth.json.
-    // Without the fix, check() found no env var and no settings baseUrl and returned
-    // undefined, causing Pi core to show "No models available" despite a valid credential.
+    // Pi calls filterModels() with credential=undefined before resolving auth.json.
+    // Without the fix, resolveCredentialRoot() returns undefined and filterModels() hides
+    // all models, so the model selector appears empty even after a successful seed.
     const agentDir = await makeAgentDir();
     await writeFile(
       join(agentDir, "auth.json"),
@@ -1480,13 +1480,23 @@ describe("extension startup", () => {
     const pi = createPi();
     await extension(pi);
 
-    // No env vars set — credential must come from auth.json alone.
-    const result = await pi.providers[0]?.auth.apiKey?.check?.({
-      ctx: { env: async () => undefined, fileExists: async () => false },
-      signal: TEST_SIGNAL,
-    });
+    const model = {
+      id: "stored-model",
+      name: "Stored model",
+      provider: "litellm",
+      api: "openai-completions" as const,
+      baseUrl: "https://stored.example.com/v1",
+      reasoning: false,
+      input: ["text"] as ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 128_000,
+      maxTokens: 4096,
+    };
 
-    expect(result).toEqual({ type: "api_key", source: "auth.json" });
+    // credential=undefined simulates Pi calling filterModels before the stored credential resolves.
+    const visible = pi.providers[0]?.filterModels?.([model], undefined);
+
+    expect(visible?.map((m) => m.id)).toEqual(["stored-model"]);
   });
 
   it("resolves native auth from the injected context instead of process env", async () => {
