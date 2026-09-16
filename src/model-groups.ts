@@ -272,9 +272,10 @@ export const NO_TRANSMISSIBLE_LEVELS = {
 
 // Efforts the Responses API accepts. pi-ai passes an unmapped level through
 // verbatim and reads `thinkingLevelMap.off` as the disable value, so a Chat-shaped
-// map would emit `off` or `max` as an effort. `none` is the disable spelling —
-// pi-ai's own `openai/gpt-5.5` entry maps `off` to it.
-const RESPONSES_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
+// map would emit `off` as an effort. `none` is the disable spelling — pi-ai's own
+// `openai/gpt-5.5` entry maps `off` to it, and its `openai/gpt-5.6-*` entries map
+// `max` to itself, so `max` is a real Responses effort and not a Chat-only value.
+const RESPONSES_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh", "max"]);
 
 // A level map is only meaningful next to the compat that serializes it, and the
 // two used to travel separately: five call sites each decided whether to copy
