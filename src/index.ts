@@ -123,6 +123,15 @@ function resolveCredentialRoot(
   return baseUrl ? normalizeBaseUrl(baseUrl, definition.allowInsecureHttp) : undefined;
 }
 
+// Resolves the base URL from all static sources in priority order:
+// definition.baseUrl (settings) → LITELLM_BASE_URL env var → auth.json stored credential.
+// Used where no live credential has been supplied yet (startup checks, requestBaseUrl).
+// For request-time resolution with a known credential, use resolveCredentialRoot() directly.
+function effectiveBaseUrl(definition: ProviderDefinition): string | undefined {
+  const stored = readStoredCredential(definition.name, join(getAgentDir(), "auth.json"));
+  return resolveCredentialRoot(definition, stored ?? undefined);
+}
+
 function requireCredentialRoot(root: string | undefined, providerName: string): string {
   if (!root) throw new Error(`no LiteLLM base URL for ${providerName}. Run /login litellm or set env vars.`);
   if (isPlaceholderHost(new URL(root).hostname)) {
@@ -1586,7 +1595,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 
   function requestBaseUrl(definition: ProviderDefinition): string {
     try {
-      return `${resolveCredentialRoot(definition) ?? DEFAULT_LITELLM_BASE_URL}/v1`;
+      return `${effectiveBaseUrl(definition) ?? DEFAULT_LITELLM_BASE_URL}/v1`;
     } catch {
       return `${DEFAULT_LITELLM_BASE_URL}/v1`;
     }
@@ -1949,9 +1958,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
         if (explicit) return normalizeBaseUrl(explicit, definition.allowInsecureHttp);
         const oauthRuntimeRoot = oauthRuntimeRoots.get(definition.name);
         if (apiKey && oauthRuntimeRoot?.apiKey === apiKey) return oauthRuntimeRoot.root;
-        // Same fallback as check(): auth.json supplies the base URL before Pi resolves the credential.
-        const stored = readStoredCredential(definition.name, join(getAgentDir(), "auth.json"));
-        return resolveCredentialRoot(definition, stored ?? undefined);
+        return effectiveBaseUrl(definition);
       },
       discover: async (credential, signal) => {
         const disabledReason = discoveryDisabledReason();
