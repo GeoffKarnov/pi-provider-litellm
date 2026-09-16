@@ -132,6 +132,10 @@ function effectiveBaseUrl(definition: ProviderDefinition): string | undefined {
   return resolveCredentialRoot(definition, stored ?? undefined);
 }
 
+function baseUrlMissing(credential: ApiKeyCredential | undefined, definition: ProviderDefinition): boolean {
+  return !(credential?.env?.[ENV_BASE_URL] ?? effectiveBaseUrl(definition));
+}
+
 function requireCredentialRoot(root: string | undefined, providerName: string): string {
   if (!root) throw new Error(`no LiteLLM base URL for ${providerName}. Run /login litellm or set env vars.`);
   if (isPlaceholderHost(new URL(root).hostname)) {
@@ -1244,12 +1248,8 @@ function createProviderAuth(
             }
           : undefined,
       check: async ({ ctx, credential }) => {
+        if (baseUrlMissing(credential, definition)) return undefined;
         const stored = readStoredCredential(definition.name, join(getAgentDir(), "auth.json"));
-        const liveUrl = credential?.env?.[ENV_BASE_URL];
-        const envUrl = definition.useDefaultEnv ? await ctx.env(ENV_BASE_URL) : undefined;
-        const storedUrl = stored?.env?.[ENV_BASE_URL];
-        const baseUrl = liveUrl ?? definition.baseUrl ?? envUrl ?? storedUrl;
-        if (!cleanConfig(baseUrl)) return undefined;
         if (credential?.key) return { type: "api_key", source: "stored credential" };
         if (stored?.key) return { type: "api_key", source: "auth.json" };
 
