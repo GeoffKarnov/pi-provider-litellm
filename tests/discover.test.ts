@@ -982,6 +982,64 @@ describe("discoverModels via /model/info", () => {
     });
   });
 
+  it("maps router medium and high effort flags for a singleton", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      jsonResponse(200, {
+        data: [
+          {
+            model_name: "custom/reasoner",
+            litellm_params: { allowed_openai_params: ["reasoning_effort"] },
+            model_info: {
+              mode: "chat",
+              supports_reasoning: true,
+              supports_none_reasoning_effort: true,
+              supports_low_reasoning_effort: true,
+              supports_medium_reasoning_effort: true,
+              supports_high_reasoning_effort: true,
+              supports_xhigh_reasoning_effort: true,
+              supports_max_reasoning_effort: true,
+            },
+          },
+        ],
+      }),
+    );
+
+    const result = await discoverModels("https://litellm.example.com", "sk-test", { modelsDev: false });
+
+    expect(result.models[0]?.thinkingLevelMap).toMatchObject({
+      off: "none",
+      low: "low",
+      medium: "medium",
+      high: "high",
+      xhigh: "xhigh",
+      max: "max",
+    });
+  });
+
+  it("denies medium and high when the router reports them unsupported", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      jsonResponse(200, {
+        data: [
+          {
+            model_name: "custom/reasoner",
+            litellm_params: { allowed_openai_params: ["reasoning_effort"] },
+            model_info: {
+              mode: "chat",
+              supports_reasoning: true,
+              supports_low_reasoning_effort: true,
+              supports_medium_reasoning_effort: false,
+              supports_high_reasoning_effort: false,
+            },
+          },
+        ],
+      }),
+    );
+
+    const result = await discoverModels("https://litellm.example.com", "sk-test", { modelsDev: false });
+
+    expect(result.models[0]?.thinkingLevelMap).toMatchObject({ low: "low", medium: null, high: null });
+  });
+
   it("merges singleton router effort flags into supported Responses levels", async () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(
       jsonResponse(200, {

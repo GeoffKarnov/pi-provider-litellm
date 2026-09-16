@@ -169,13 +169,12 @@ function explicitLimit(value: number | undefined): number | undefined {
 
 const EXTENDED_LEVELS = THINKING_LEVEL_DEFINITIONS.map(([level]) => level);
 
-const LITELLM_LEVEL_FLAGS = {
-  off: "supports_none_reasoning_effort",
-  minimal: "supports_minimal_reasoning_effort",
-  low: "supports_low_reasoning_effort",
-  xhigh: "supports_xhigh_reasoning_effort",
-  max: "supports_max_reasoning_effort",
-} as const;
+// Derived from the level table rather than restated: a second hand-written copy
+// silently dropped `supports_medium_reasoning_effort` and
+// `supports_high_reasoning_effort`, so those router flags were never read.
+const LITELLM_LEVEL_FLAGS = Object.fromEntries(THINKING_LEVEL_DEFINITIONS.map(([level, , flag]) => [level, flag])) as {
+  [Definition in (typeof THINKING_LEVEL_DEFINITIONS)[number] as Definition[0]]: Definition[2];
+};
 
 function normalizeEffort(level: string): (typeof EXTENDED_LEVELS)[number] | undefined {
   const normalized = level === "none" ? "off" : level;
